@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Install relocatable Rust capability and NIF source data into an RSB stage."""
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import shutil
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def write(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def digest_files(prefix, paths):
+    digest = hashlib.sha256()
+    for path in sorted(paths):
+        digest.update(str(path.relative_to(prefix)).encode() + b"\0")
+        with path.open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def core_build(prefix, inputs, target_cflags):
+    # Hash installed artifacts once, during packaging; consumers read this
+    # signature instead of repeatedly hashing the compiler and std libraries.
+    programs = [prefix / "bin/rustc", prefix / "bin/cargo"]
+    programs.extend((prefix / "lib").glob("librustc_driver-*"))
+    libraries = [p for p in (prefix / "lib/rustlib").rglob("*")
+                 if p.is_file() and p.suffix in (".rlib", ".a", ".so", ".dylib")]
+    if not libraries:
+        raise ValueError("installed Rust standard libraries are missing")
+    recipes = [ROOT / name for name in (
+        "config/rust/rust-common.cfg", "config/rust/host.cfg",
+        "config/rust/rust-nif-support.cfg", "config/rust/nif.Cargo.lock",
+        "tools/bootstrap-config", "tools/build-env", "tools/install-support")]
+    recipes.extend((ROOT / "config/rust").glob("rtems-rust-*.cfg"))
+    return {"artifacts": digest_files(prefix, programs + libraries),
+            "recipe": digest_files(ROOT, recipes),
+            "c_sdk": inputs["c_sdk_identity"],
+            "bootstrap": inputs["bootstrap_sha256"],
+            "target_cflags": target_cflags}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("kind", choices=["core", "nif", "vendor"])
+    parser.add_argument("--prefix", type=Path, required=True)
+    parser.add_argument("--host")
+    parser.add_argument("--target")
+    parser.add_argument("--rtems-major", type=int)
+    parser.add_argument("--c-target")
+    parser.add_argument("--errno", choices=["__errno", "_tls_errno"])
+    parser.add_argument("--rustler", type=Path)
+    parser.add_argument("--inventory", type=Path)
+    parser.add_argument("--libc", type=Path)
+    parser.add_argument("--vendor", type=Path)
+    parser.add_argument("--bootstrap-inputs", type=Path)
+    parser.add_argument("--target-cflags", default="")
+    parser.add_argument("--core-prefix", type=Path)
+    args = parser.parse_args()
+    source = json.loads((ROOT / "sources.json").read_text())
+    identity = hashlib.sha256((ROOT / "sources.json").read_bytes()).hexdigest()
+    if args.kind == "core":
+        if args.bootstrap_inputs is None:
+            parser.error("core installation requires --bootstrap-inputs")
+        capability = {"schema": 1, "sources": identity, "host": args.host,
+                      "rust": {"version": "1.100.0", "commit": source["components"]["rust"]["base"]},
+                      "targets": {args.target: {"rtems_major": args.rtems_major,
+                          "c_target": args.c_target, "panic": "unwind",
+                          "newlib_errno": args.errno, "c_enum_min_bits": 32,
+                          "std_variants": ["generic"]}}}
+        capability["build"] = core_build(args.prefix,
+            json.loads(args.bootstrap_inputs.read_text()), args.target_cflags)
+        capability["identity"] = hashlib.sha256(json.dumps(
+            capability, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        write(args.prefix / "share/rtems/rust-support.json", json.dumps(capability, indent=2) + "\n")
+        write(args.prefix / "RUST_TOOLCHAIN_HOST", args.host + "\n")
+    elif args.kind == "vendor":
+        # .crate archives have package checksums in Cargo.lock, but directory
+        # sources additionally require a per-file integrity inventory.
+        packages = json.loads((ROOT / "config/rust/nif-packages.json").read_text())
+        for package in packages:
+            directory = args.prefix / (package["name"] + "-" + package["version"])
+            files = {str(p.relative_to(directory)): hashlib.sha256(p.read_bytes()).hexdigest()
+                     for p in directory.rglob("*") if p.is_file() and p.name != ".cargo-checksum.json"}
+            if not files:
+                raise ValueError(f"missing vendored source {directory}")
+            write(directory / ".cargo-checksum.json", json.dumps({"files": files,
+                "package": package["checksum"]}, indent=2, sort_keys=True) + "\n")
+    else:
+        if args.core_prefix is None:
+            parser.error("NIF installation requires --core-prefix")
+        core = json.loads((args.core_prefix / "share/rtems/rust-support.json").read_text())
+        if core["sources"] != identity:
+            raise ValueError("Rust core and NIF source pins differ; run make rust-support")
+        base = args.prefix / "share/rust-nif"
+        for name, directory, version in [("rustler", args.rustler, "0.39.0"),
+                                         ("inventory", args.inventory, "0.3.25"),
+                                         ("libc", args.libc, "0.2.191")]:
+            shutil.copytree(directory, base / "crates" / name / version,
+                            ignore=shutil.ignore_patterns("target", ".git", ".cargo"), dirs_exist_ok=True)
+        shutil.copytree(args.vendor, base / "vendor", dirs_exist_ok=True)
+        # Cargo resolves config-file paths from its parent directory, so these
+        # paths are relative to share/rust-nif, not the cargo/ leaf directory.
+        write(base / "cargo/config.toml", '''[patch.crates-io]
+rustler_039 = { package = "rustler", path = "crates/rustler/0.39.0/rustler" }
+inventory = { path = "crates/inventory/0.3.25" }
+libc = { path = "crates/libc/0.2.191" }
+''')
+        write(base / "support.json", json.dumps({"schema": 1, "identity": core["identity"],
+            "rustler": ["0.39.0"], "cargo_config": "share/rust-nif/cargo/config.toml"}, indent=2) + "\n")
+        shutil.copy2(ROOT / "sources.json", base / "sources.json")
+
+
+if __name__ == "__main__":
+    main()

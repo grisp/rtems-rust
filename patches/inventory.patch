@@ -1,0 +1,22 @@
+From dba0c72280eb2aa17f26c289eb09b0d9230b819e Mon Sep 17 00:00:00 2001
+From: Sebastien Merle <s.merle@gmail.com>
+Date: Sat, 14 Nov 2026 00:38:54 +0100
+Subject: [PATCH] Add RTEMS support
+
+Use the ELF .init_array section to register inventory constructors
+on RTEMS.
+
+---
+
+diff --git a/src/lib.rs b/src/lib.rs
+index bc028eca59881a4ecbe7b93f7fc5cf176c92d649..ebdea99f547823ee7477e47d2eb5b86243ee80f2 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -545,6 +545,7 @@ macro_rules! __do_submit {
+                         target_os = "nto",
+                         target_os = "openbsd",
+                         target_os = "redox",
++                        target_os = "rtems",
+                         target_os = "vxworks",
+                         target_os = "none",
+                     )

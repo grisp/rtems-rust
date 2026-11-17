@@ -1,0 +1,2031 @@
+From: Sebastien Merle <s.merle@gmail.com>
+Date: Sat, 14 Nov 2026 00:27:43 +0100
+Subject: [PATCH] Add crate isolation and static NIF bundling
+
+Independent NIF crates sharing one Rustler instance also share its
+registration inventories. Named initialization symbols alone do not
+isolate their functions and resources.
+
+Add opt-in crate isolation and helper ownership records, preserving
+default behavior. Add rustler-bundler to generate a single staticlib
+from ordinary NIF crates and report its named initialization entries
+for integration with static NIF loaders.
+
+Document the linking requirements and add unit and CLI coverage.
+
+---
+
+diff --git a/Cargo.toml b/Cargo.toml
+index ea3ca2ea31be5c7a257252b7f1711e27f6d1c496..99e2156477b69474a96961743eb1bfb4c3e31b03 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -4,6 +4,7 @@ members = [
+   "rustler",
+   "rustler/otp_headers/codegen",
+   "rustler_codegen",
++  "rustler_bundler",
+   "rustler_tests/native/binary_example",
+   "rustler_tests/native/rustler_test",
+   "rustler_tests/native/rustler_bigint_test",
+diff --git a/README.md b/README.md
+index 7157050d9a946a3fa89adeb832df8ef41999cc27..166626bc8909d8354f046c0278753dcca8a6d5ec 100644
+--- a/README.md
++++ b/README.md
+@@ -55,6 +55,36 @@ fn add(a: i64, b: i64) -> i64 {
+ rustler::init!("Elixir.Math");
+ ```
+ 
++#### NIF crate isolation
++
++Enable `nif_crate_isolation` when independent NIF crates share one Rustler
++instance in a linked library. The feature separates their function tables and
++resource registrations so each init entry registers the NIFs belonging to its
++Erlang module. Use one `rustler::init!` entry per NIF crate.
++
++The aggregate crate enables the feature on its Rustler dependency:
++
++```toml
++[dependencies]
++rustler = { version = "0.39.0", default-features = false, features = ["nif_crate_isolation"] }
++```
++
++Cargo unifies the feature across dependencies using the same Rustler package.
++Registrations identify their originating crate name and package version.
++For registrations defined in helper crates, the aggregate links typed ownership
++records with `rustler::nif_crate_owners!`. The optional host tool
++[`rustler-bundler`](rustler_bundler/README.md) derives those records from Cargo's
++resolved dependency graph and generates the aggregate crate. Its guide covers
++Rebar3/Mix integration, manual aggregate creation and the required final linking
++and static NIF loader setup. The runtime feature is usable without the tool.
++
++The feature synchronizes the shared resource registry during registration and
++lookup. Ownership metadata and registry locking are compiled only when the
++feature is enabled. Each Rust resource type has one owning Erlang module;
++a conflicting registration fails without replacing the original handle.
++Distinct resource types can use the same Erlang resource name. Aggregates
++require compatible Rustler versions and unambiguous crate identities.
++
+ #### Minimal Supported Rust Version (MSRV)
+ 
+ Rustler currently has a minimal supported Rust version (MSRV) of 1.91. This
+diff --git a/rustler/Cargo.toml b/rustler/Cargo.toml
+index 4638a92441025f938570dcd1c06a0b45c99bf768..10042520d5deb2211c2cf9bacd7468faad0d8e05 100644
+--- a/rustler/Cargo.toml
++++ b/rustler/Cargo.toml
+@@ -14,6 +14,8 @@ big_integer = ["dep:num-bigint"]
+ default = ["nif_version_2_15"]
+ derive = []
+ allocator = []
++# Isolate registrations when several NIF crates share one linked Rust runtime.
++nif_crate_isolation = []
+ serde = ["dep:serde"]
+ # for nif versions and their changes see
+ # https://github.com/erlang/otp/blob/master/erts/emulator/beam/erl_nif.h
+diff --git a/rustler/src/codegen_runtime.rs b/rustler/src/codegen_runtime.rs
+index 703ae8f15ae7f350e198bbd8e3cc4adc117c655c..09c3f5fe5781072f15eb9b2a25aa67ba46c475bb 100644
+--- a/rustler/src/codegen_runtime.rs
++++ b/rustler/src/codegen_runtime.rs
+@@ -10,6 +10,61 @@ use crate::{Encoder, Env, OwnedBinary, Term};
+ // Re-export of inventory
+ pub use inventory;
+ 
++// Ownership is selected in the runtime crate, so host proc-macro feature
++// unification cannot accidentally enable it in a default-mode target crate.
++#[cfg(feature = "nif_crate_isolation")]
++pub struct CrateNif {
++    pub owner: &'static str,
++    pub nif: crate::Nif,
++}
++#[cfg(feature = "nif_crate_isolation")]
++inventory::collect!(CrateNif);
++
++impl crate::Nif {
++    #[doc(hidden)]
++    #[cfg(not(feature = "nif_crate_isolation"))]
++    pub const fn with_crate(self, _owner: &'static str) -> Self {
++        self
++    }
++
++    #[doc(hidden)]
++    #[cfg(feature = "nif_crate_isolation")]
++    pub const fn with_crate(self, owner: &'static str) -> CrateNif {
++        CrateNif { owner, nif: self }
++    }
++}
++
++/// A helper crate's registrations belong to the specified NIF crate.
++/// Normally emitted by `rustler_bundler` through `nif_crate_owners!`.
++#[cfg(feature = "nif_crate_isolation")]
++pub struct CrateOwnership {
++    pub source: &'static str,
++    pub owner: &'static str,
++}
++#[cfg(feature = "nif_crate_isolation")]
++inventory::collect!(CrateOwnership);
++
++#[cfg(feature = "nif_crate_isolation")]
++pub(crate) fn owns_crate(owner: &str, source: &str) -> bool {
++    source == owner
++        || inventory::iter::<CrateOwnership>
++            .into_iter()
++            .any(|entry| entry.source == source && entry.owner == owner)
++}
++
++#[cfg(feature = "nif_crate_isolation")]
++pub fn nifs_for_crate(owner: &str) -> impl Iterator<Item = &'static crate::Nif> + '_ {
++    inventory::iter::<CrateNif>
++        .into_iter()
++        .filter(move |entry| owns_crate(owner, entry.owner))
++        .map(|entry| &entry.nif)
++}
++
++#[cfg(not(feature = "nif_crate_isolation"))]
++pub fn nifs_for_crate(_owner: &str) -> impl Iterator<Item = &'static crate::Nif> {
++    inventory::iter::<crate::Nif>.into_iter()
++}
++
+ // Re-export of resource registration
+ pub use crate::resource::Registration as ResourceRegistration;
+ 
+diff --git a/rustler/src/lib.rs b/rustler/src/lib.rs
+index 9c84e67e9e024611d57ec93a53544a63a90c6c1c..5392342dc01a5294641941550d58693335ed7a1a 100644
+--- a/rustler/src/lib.rs
++++ b/rustler/src/lib.rs
+@@ -26,6 +26,25 @@
+ #[doc(hidden)]
+ pub mod codegen_runtime;
+ 
++/// Assign registrations from helper crates to their enclosing NIF crates.
++///
++/// Requires `nif_crate_isolation`. Keys are `crate_name@package_version`.
++/// Emit this once in the aggregate crate; NIF dependencies need no changes.
++#[cfg(feature = "nif_crate_isolation")]
++#[macro_export]
++macro_rules! nif_crate_owners {
++    ($($source:literal => $owner:literal),* $(,)?) => {
++        $(
++            $crate::codegen_runtime::inventory::submit! {
++                $crate::codegen_runtime::CrateOwnership {
++                    source: $source,
++                    owner: $owner,
++                }
++            }
++        )*
++    };
++}
++
+ mod alloc;
+ pub use crate::alloc::EnifAllocator;
+ 
+diff --git a/rustler/src/resource/registration.rs b/rustler/src/resource/registration.rs
+index c891bb77a1322baf4dba5dd60546b01f88020b59..0f69ebdc0e5515d2ec8bd88324d9675938f7ac5d 100644
+--- a/rustler/src/resource/registration.rs
++++ b/rustler/src/resource/registration.rs
+@@ -17,6 +17,8 @@ pub struct Registration {
+     get_type_id: fn() -> TypeId,
+     get_type_name: fn() -> &'static str,
+     type_name: Option<&'static str>,
++    #[cfg(feature = "nif_crate_isolation")]
++    owner: &'static str,
+     init: ErlNifResourceTypeInit,
+ }
+ 
+@@ -48,6 +50,34 @@ impl Registration {
+         Ok(())
+     }
+ 
++    #[doc(hidden)]
++    pub const fn with_crate(self, _owner: &'static str) -> Self {
++        #[cfg(feature = "nif_crate_isolation")]
++        {
++            return Self {
++                owner: _owner,
++                ..self
++            };
++        }
++        #[cfg(not(feature = "nif_crate_isolation"))]
++        self
++    }
++
++    #[doc(hidden)]
++    pub fn register_for_crate(env: Env, _owner: &str) -> Result<(), ResourceInitError> {
++        #[cfg(feature = "nif_crate_isolation")]
++        {
++            for reg in inventory::iter::<Registration>() {
++                if crate::codegen_runtime::owns_crate(_owner, reg.owner) {
++                    reg.register(env)?;
++                }
++            }
++            Ok(())
++        }
++        #[cfg(not(feature = "nif_crate_isolation"))]
++        Self::register_all_collected(env)
++    }
++
+     /// Generate a new (pending) resource type registration.
+     pub const fn new<T: Resource>() -> Self {
+         Self {
+@@ -63,6 +93,8 @@ impl Registration {
+             get_type_name: std::any::type_name::<T>,
+             get_type_id: TypeId::of::<T>,
+             type_name: None,
++            #[cfg(feature = "nif_crate_isolation")]
++            owner: "",
+         }
+         .maybe_add_destructor_callback::<T>()
+         .maybe_add_down_callback::<T>()
+@@ -150,7 +182,18 @@ impl Registration {
+             )
+         };
+         if let Some(ptr) = res {
+-            unsafe { traits::register_resource_type(type_id, ptr) };
++            #[cfg(feature = "nif_crate_isolation")]
++            if !unsafe { traits::register_resource_type(type_id, ptr) } {
++                eprintln!(
++                    "Rustler resource {} is already owned by another NIF module",
++                    (self.get_type_name)()
++                );
++                return Err(ResourceInitError);
++            }
++            #[cfg(not(feature = "nif_crate_isolation"))]
++            unsafe {
++                traits::register_resource_type(type_id, ptr)
++            };
+             Ok(())
+         } else {
+             Err(ResourceInitError)
+diff --git a/rustler/src/resource/traits.rs b/rustler/src/resource/traits.rs
+index 24fe09ec469862fd1472cb9a1213947c148e11f9..41847b746b74a7ba4a24aa86cdcd1c57e79ab1b1 100644
+--- a/rustler/src/resource/traits.rs
++++ b/rustler/src/resource/traits.rs
+@@ -1,5 +1,7 @@
+ use std::any::TypeId;
+ use std::collections::HashMap;
++#[cfg(feature = "nif_crate_isolation")]
++use std::sync::Mutex;
+ use std::sync::OnceLock;
+ 
+ use crate::sys::ErlNifResourceType;
+@@ -9,9 +11,11 @@ type NifResourcePtr = *const ErlNifResourceType;
+ 
+ /// Map from `TypeId` to the `NifResourcePtr`. To be able to store this in a `OnceLock`, the
+ /// pointer is type-erased and stored as a `usize`.
++#[cfg(not(feature = "nif_crate_isolation"))]
+ static mut RESOURCE_TYPES: OnceLock<HashMap<TypeId, usize>> = OnceLock::new();
+ 
+ /// Register an Erlang resource type handle for a particular type given by its `TypeId`
++#[cfg(not(feature = "nif_crate_isolation"))]
+ #[allow(static_mut_refs)]
+ pub(crate) unsafe fn register_resource_type(type_id: TypeId, resource_type: NifResourcePtr) {
+     RESOURCE_TYPES.get_or_init(Default::default);
+@@ -21,6 +25,25 @@ pub(crate) unsafe fn register_resource_type(type_id: TypeId, resource_type: NifR
+         .insert(type_id, resource_type as usize);
+ }
+ 
++#[cfg(feature = "nif_crate_isolation")]
++static RESOURCE_TYPES: OnceLock<Mutex<HashMap<TypeId, usize>>> = OnceLock::new();
++
++#[cfg(feature = "nif_crate_isolation")]
++pub(crate) unsafe fn register_resource_type(
++    type_id: TypeId,
++    resource_type: NifResourcePtr,
++) -> bool {
++    use std::collections::hash_map::Entry;
++    let mut types = RESOURCE_TYPES.get_or_init(Default::default).lock().unwrap();
++    match types.entry(type_id) {
++        Entry::Vacant(entry) => {
++            entry.insert(resource_type as usize);
++            true
++        }
++        Entry::Occupied(entry) => *entry.get() == resource_type as usize,
++    }
++}
++
+ /// Trait that needs to be implemented to use a type as a NIF resource type.
+ ///
+ /// The Erlang runtime provides the following guarantees:
+@@ -67,7 +90,10 @@ pub(crate) trait ResourceExt: 'static {
+     /// Get the NIF resource type handle for this type if it had been registered before
+     #[allow(static_mut_refs)]
+     fn get_resource_type() -> Option<NifResourcePtr> {
++        #[cfg(not(feature = "nif_crate_isolation"))]
+         let map = unsafe { RESOURCE_TYPES.get()? };
++        #[cfg(feature = "nif_crate_isolation")]
++        let map = RESOURCE_TYPES.get()?.lock().unwrap();
+         map.get(&TypeId::of::<Self>())
+             .map(|ptr| *ptr as NifResourcePtr)
+     }
+diff --git a/rustler_bundler/Cargo.toml b/rustler_bundler/Cargo.toml
+new file mode 100644
+index 0000000000000000000000000000000000000000..fcb59fac018900a63fb9da5ea827b49d56c0f699
+--- /dev/null
++++ b/rustler_bundler/Cargo.toml
+@@ -0,0 +1,18 @@
++[package]
++name = "rustler_bundler"
++version = "0.39.0"
++edition = "2021"
++rust-version = "1.91"
++description = "Prepare and build statically linked bundles of Rustler NIF crates"
++license = "MIT/Apache-2.0"
++repository = "https://github.com/rusterlium/rustler"
++readme = "README.md"
++
++[[bin]]
++name = "rustler-bundler"
++path = "src/main.rs"
++
++[dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++toml = "1.2"
+diff --git a/rustler_bundler/README.md b/rustler_bundler/README.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8ff395534606a00d731059017bfc2e4ebd3100a
+--- /dev/null
++++ b/rustler_bundler/README.md
+@@ -0,0 +1,197 @@
++# Rustler bundler
++
++`rustler-bundler` prepares a single Rust `staticlib` containing independent
++Rustler NIF crates. Build systems can invoke it with a JSON specification and
++consume its JSON output.
++
++## Installation
++
++From the Rustler source tree:
++
++```sh
++cargo install --path rustler_bundler
++rustler-bundler --version
++```
++
++## Preparing and building a bundle
++
++Each NIF crate uses ordinary Rustler attributes and one `rustler::init!`.
++It must provide `lib` or `rlib` output so Cargo can link it as a dependency:
++
++```toml
++[lib]
++crate-type = ["cdylib", "rlib"]
++```
++
++Create a specification, for example `/project/bundle.json`:
++
++```json
++{
++  "schema": 1,
++  "out_dir": "/project/_build/nif-bundle",
++  "inputs": [
++    {
++      "id": "math",
++      "manifest_path": "/project/native/math/Cargo.toml",
++      "features": [],
++      "default_features": true
++    },
++    {
++      "id": "image",
++      "manifest_path": "/project/deps/image/native/image/Cargo.toml"
++    }
++  ],
++  "cargo": ["cargo"],
++  "release": true,
++  "target_dir": "/project/_build/rust-target"
++}
++```
++
++Each input identifies a package or workspace manifest. The tool selects its
++workspace default members and library targets producing `cdylib` or `staticlib`;
++`library_types` can override those output kinds. Features and `default_features`
++apply to the selected packages. Each input's unique `id` is echoed in its
++`entries[].input` values, allowing callers to associate entries with their inputs.
++Paths must be absolute; `out_dir` is owned by the generator. Features are
++unqualified Cargo feature names.
++
++Callers that already know their library targets can provide `roots` instead of
++`inputs`. Each root specifies `manifest_path`, `package` (Cargo package name),
++`library` (library target name), and optional `features` and `default_features`.
++
++The optional `cargo` command array may select a toolchain (`["cargo", "+nightly"]`)
++or an explicit Cargo executable.
++`target` selects a target triple or JSON target specification. All Cargo
++invocations inherit the caller's environment, including linker configuration
++and `CARGO_ENCODED_RUSTFLAGS`.
++
++The optional `offline` boolean defaults to false. When true, the tool passes
++`--offline` to Cargo for dependency resolution and compilation, preventing
++network access. Required dependencies must already be available locally.
++For a separate Cargo invocation after `prepare`, pass `--offline` to that
++command too if needed.
++
++```sh
++rustler-bundler prepare --spec /project/bundle.json
++cargo build --manifest-path /project/_build/nif-bundle/Cargo.toml \
++    --release --target-dir /project/_build/rust-target
++```
++
++Alternatively, the tool can perform both steps using the specification's
++`cargo`, `release`, `target`, `target_dir` and `offline` settings:
++
++```sh
++rustler-bundler build --spec /project/bundle.json
++```
++
++`prepare` writes one JSON result to stdout, with `schema: 1`,
++`reason: "rustler-bundle"`, `manifest_path`, `package`, `library`,
++`ownership_path`, `ownership`, `archive` and `entries`. Each entry contains its
++library name, named initialization symbol (such as `math_nif_nif_init`), and
++input ID when discovered from `inputs`. `archive` is null after preparation.
++`build` forwards Cargo's JSON messages, including compiler diagnostics, and sets
++`archive` to the produced file's path. An input selection containing no matching
++libraries returns no entries and a null archive. Progress and tool errors go to
++stderr; a nonzero exit status means the operation failed.
++
++The generated crate depends on every root and enables `nif_crate_isolation`
++on the same resolved Rustler package. Cargo configuration inherited from the
++output directory's ancestors supplies patches, profiles and source overrides.
++For a separate output tree, provide equivalent Cargo configuration there.
++All roots must use one compatible Rustler package; incompatible sources or
++versions are rejected.
++
++The tool walks normal library dependencies in the target-filtered Cargo graph,
++stopping at other NIF roots. It generates typed ownership records in
++`src/ownership.rs`; dependency source code needs no ownership annotations or
++environment variables. Proc macros and build/dev dependencies are excluded.
++
++## Linking into a runtime
++
++The archive contains all roots and a single Rust dependency graph. Link it
++**once**, retaining its inventory constructors and ownership records. On GNU
++linkers this generally means:
++
++```sh
++cc ... -Wl,--whole-archive /path/to/librustler_nif_bundle.a \
++    -Wl,--no-whole-archive ...
++```
++
++Use the corresponding archive-retention mechanism on other linkers. Preserve
++constructor sections through the final executable link and linker script.
++Native system libraries depend on the Rust target and NIF dependencies; inspect
++`cargo rustc -- --print=native-static-libs` for the final bundle's requirements.
++Do not combine independently built Rust staticlibs or change to `panic=abort`.
++
++Register **every** `entries[].init` symbol with the runtime's static NIF loader,
++mapping it to the filename passed to `erlang:load_nif/2`. The Erlang/Elixir module
++name remains the name supplied to `rustler::init!`; it is different from this
++library/entry name. OTP must support multiple named entries from one archive,
++or its build integration must supply the equivalent static lookup table. Adding
++the archive alone is insufficient. Platform integrations own that final link,
++table generation and runtime packaging.
++
++Rebar3 integrations can supply input manifests and feature selections, invoke
++`build`, and consume its archive path and entries. Cargo compiler diagnostics
++remain available in the JSON stream. Disable separate
++per-crate compilation for the static target, retain its loader/header setup,
++and retain ordinary dynamic compilation for host builds.
++
++Mix integrations can invoke the executable once for an application or release
++and configure each `use Rustler` module with `skip_compilation?: true` for the
++static target. Preserve each module's loading filename and load data and add
++matching entries to OTP's static loader. The existing Mix compiler copies
++dynamic libraries; it does not itself build/link this static bundle. No new Mix
++task is included here. Ordinary Mix dynamic builds need no configuration change.
++
++## Workspace policy
++
++Set the optional `workspace_manifest` to the owning application's Cargo.toml.
++The bundle inherits that workspace's resolver, profiles, `[patch]`, `[replace]`
++and Cargo feature gates. Relative patch paths are resolved from the original
++workspace root. Dependency workspaces supply ordinary libraries; their profiles
++and patch tables do not override the application's settings.
++
++The owning workspace's Cargo.lock seeds the derived lockfile. Its locked
++registry versions and Git revisions are preserved for its reachable dependencies.
++The bundler attempts to reconcile the combined graph with those choices and
++reports a conflict when the requirements cannot preserve them. Update the
++application's dependency requirements and lockfile deliberately to resolve such
++a conflict. New dependencies without an existing locked choice resolve normally.
++Dependency library lockfiles do not control resolution, matching normal Cargo
++behavior. Without an owning lockfile, Cargo maintains the generated lockfile. Explicit patches, including SDK patches, can replace registry
++packages with local sources.
++
++The bundler writes only its output directory, leaving input manifests and locks
++unchanged. `build` uses `--locked` after resolution. Results include
++`workspace_inputs`: the source workspace manifest and lock paths, including
++missing lock paths, for build systems to track creation, changes and deletion.
++The normal Cargo configuration search still starts in the generated bundle;
++put shared `.cargo/config.toml` settings in an ancestor of that directory.
++
++## Manual aggregate creation
++
++The runtime feature can also be used without this executable. Create a Cargo
++`staticlib` depending on all NIF roots and the same Rustler package with
++`default-features = false, features = ["nif_crate_isolation"]`. Retain each root
++with `extern crate root_alias;` and declare helper ownership in the aggregate:
++
++```rust
++extern crate math_nif;
++extern crate image_nif;
++rustler::nif_crate_owners! {
++    "math_helper@0.1.0" => "math_nif@0.1.0",
++    "image_helper@0.2.0" => "image_nif@0.1.0",
++}
++```
++
++Keys use Rust library crate names (hyphens become underscores) and package
++versions. Include all transitive helper libraries containing registrations;
++stop traversal at another independently initialized NIF root. A helper used by
++two roots can have two records. A given Rust resource type can only belong to
++one Erlang module: loading a second owner fails without replacing its handle.
++Distinct Rust types may use the same Erlang resource name. Same-name/version
++crates from different sources cannot be distinguished and are rejected by the
++tool. All NIF roots must be known to the bundle; arbitrary precompiled archives
++cannot be merged into this shared Rust graph. These restrictions also apply to
++manually assembled bundles.
+diff --git a/rustler_bundler/src/main.rs b/rustler_bundler/src/main.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a641a8c6c51509530df9790601d7429f0784ed1f
+--- /dev/null
++++ b/rustler_bundler/src/main.rs
+@@ -0,0 +1,817 @@
++use serde::{Deserialize, Serialize};
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs;
++use std::io::{self, BufRead};
++use std::path::{Path, PathBuf};
++use std::process::{Command, Stdio};
++
++mod workspace;
++
++type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Spec {
++    schema: u32,
++    out_dir: PathBuf,
++    #[serde(default)]
++    roots: Vec<Root>,
++    #[serde(default)]
++    inputs: Vec<Input>,
++    #[serde(default = "default_cargo")]
++    cargo: Vec<String>,
++    workspace_manifest: Option<PathBuf>,
++    target: Option<String>,
++    target_dir: Option<PathBuf>,
++    #[serde(default)]
++    release: bool,
++    #[serde(default)]
++    offline: bool,
++}
++fn default_cargo() -> Vec<String> {
++    vec!["cargo".into()]
++}
++fn default_true() -> bool {
++    true
++}
++
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Input {
++    id: String,
++    manifest_path: PathBuf,
++    #[serde(default)]
++    features: Vec<String>,
++    #[serde(default = "default_true")]
++    default_features: bool,
++    #[serde(default = "default_library_types")]
++    library_types: Vec<String>,
++}
++fn default_library_types() -> Vec<String> {
++    vec!["cdylib".into(), "staticlib".into()]
++}
++
++#[derive(Deserialize)]
++struct Workspace {
++    workspace_root: PathBuf,
++    packages: Vec<Package>,
++    workspace_members: Vec<String>,
++    workspace_default_members: Option<Vec<String>>,
++}
++
++#[derive(Clone, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct Root {
++    #[serde(default)]
++    input: Option<String>,
++    manifest_path: PathBuf,
++    package: String,
++    library: String,
++    #[serde(default)]
++    features: Vec<String>,
++    #[serde(default = "default_true")]
++    default_features: bool,
++}
++
++#[derive(Deserialize)]
++struct Metadata {
++    packages: Vec<Package>,
++    resolve: Resolve,
++}
++#[derive(Deserialize)]
++struct Package {
++    id: String,
++    name: String,
++    version: String,
++    source: Option<String>,
++    manifest_path: PathBuf,
++    targets: Vec<Target>,
++    features: BTreeMap<String, Vec<String>>,
++}
++#[derive(Deserialize)]
++struct Target {
++    name: String,
++    kind: Vec<String>,
++}
++#[derive(Deserialize)]
++struct Resolve {
++    root: String,
++    nodes: Vec<Node>,
++}
++#[derive(Deserialize)]
++struct Node {
++    id: String,
++    deps: Vec<Dep>,
++    features: Vec<String>,
++}
++#[derive(Deserialize)]
++struct Dep {
++    pkg: String,
++    dep_kinds: Vec<DepKind>,
++}
++#[derive(Deserialize)]
++struct DepKind {
++    kind: Option<String>,
++}
++
++#[derive(Serialize)]
++struct Bundle {
++    schema: u32,
++    manifest_path: PathBuf,
++    package: &'static str,
++    library: &'static str,
++    ownership_path: PathBuf,
++    archive: Option<PathBuf>,
++    entries: Vec<Entry>,
++    ownership: Vec<Ownership>,
++    workspace_inputs: Vec<PathBuf>,
++}
++#[derive(Serialize)]
++struct Entry {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    input: Option<String>,
++    library: String,
++    init: String,
++}
++#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
++struct Ownership {
++    source: String,
++    owner: String,
++}
++
++fn main() {
++    if let Err(error) = run() {
++        eprintln!("rustler-bundler: {error}");
++        std::process::exit(1);
++    }
++}
++
++fn run() -> Result<()> {
++    let args: Vec<_> = std::env::args().skip(1).collect();
++    if args == ["--version"] {
++        println!("rustler-bundler {} (schema 1)", env!("CARGO_PKG_VERSION"));
++        return Ok(());
++    }
++    if args.len() != 3 || !["prepare", "build"].contains(&args[0].as_str()) || args[1] != "--spec" {
++        return Err(
++            "usage: rustler-bundler <prepare|build> --spec /absolute/path/bundle.json".into(),
++        );
++    }
++    let spec: Spec = serde_json::from_slice(&fs::read(&args[2])?)?;
++    if spec.schema != 1 || !spec.out_dir.is_absolute() {
++        return Err("schema must be 1 and out_dir must be absolute".into());
++    }
++    let roots = discover(&spec)?;
++    let mut bundle = prepare(&spec, &roots)?;
++    if args[0] == "build" && !roots.is_empty() {
++        bundle.archive = Some(build(&spec, &bundle)?);
++    }
++    // Cargo's JSON stream and this result can share one streaming decoder.
++    let mut result = serde_json::to_value(&bundle)?;
++    result["reason"] = "rustler-bundle".into();
++    println!("{}", serde_json::to_string(&result)?);
++    Ok(())
++}
++
++fn quoted(value: &str) -> String {
++    toml::Value::String(value.into()).to_string()
++}
++fn write_changed(path: &Path, data: &str) -> Result<()> {
++    if fs::read_to_string(path).ok().as_deref() != Some(data) {
++        fs::create_dir_all(path.parent().ok_or("output has no parent")?)?;
++        fs::write(path, data)?;
++    }
++    Ok(())
++}
++fn cargo(spec: &Spec) -> Result<Command> {
++    let (program, args) = spec.cargo.split_first().ok_or("cargo command is empty")?;
++    let mut command = Command::new(program);
++    command.args(args).current_dir(&spec.out_dir);
++    Ok(command)
++}
++fn metadata_command(spec: &Spec) -> Result<Command> {
++    let mut command = cargo(spec)?;
++    command.args(["metadata", "--format-version=1"]);
++    if spec.offline {
++        command.arg("--offline");
++    }
++    if let Some(target) = &spec.target {
++        command.args(["--filter-platform", target]);
++    }
++    command.stderr(Stdio::inherit());
++    Ok(command)
++}
++fn read_metadata<T: serde::de::DeserializeOwned>(mut command: Command) -> Result<T> {
++    let output = command.output()?;
++    if !output.status.success() {
++        return Err(format!("cargo metadata failed ({}) for {command:?}", output.status).into());
++    }
++    Ok(serde_json::from_slice(&output.stdout)?)
++}
++fn metadata(spec: &Spec) -> Result<Metadata> {
++    read_metadata(metadata_command(spec)?)
++}
++
++// Discover selected library targets without requiring build-system-specific package logic.
++fn discover(spec: &Spec) -> Result<Vec<Root>> {
++    if !spec.roots.is_empty() {
++        if !spec.inputs.is_empty() {
++            return Err("specify inputs or roots, not both".into());
++        }
++        return Ok(spec.roots.clone());
++    }
++    if spec.inputs.is_empty() {
++        return Err("inputs or roots must not be empty".into());
++    }
++    let mut ids = BTreeSet::new();
++    let mut roots = Vec::new();
++    for input in &spec.inputs {
++        if !ids.insert(&input.id) {
++            return Err(format!("duplicate input id {}", input.id).into());
++        }
++        if !input.manifest_path.is_absolute() {
++            return Err("input manifest_path must be absolute".into());
++        }
++        if input.features.iter().any(|f| f.contains('/')) {
++            return Err("configure unqualified features on each NIF input".into());
++        }
++        let mut command = metadata_command(spec)?;
++        // Discover in the input workspace, including its ancestor Cargo configuration.
++        command
++            .current_dir(
++                input
++                    .manifest_path
++                    .parent()
++                    .ok_or("invalid input manifest path")?,
++            )
++            .args(["--no-deps", "--manifest-path"])
++            .arg(&input.manifest_path);
++        if !input.default_features {
++            command.arg("--no-default-features");
++        }
++        if !input.features.is_empty() {
++            command.arg("--features").arg(input.features.join(","));
++        }
++        let workspace: Workspace = read_metadata(command)?;
++        roots.extend(selected_roots(workspace, input));
++    }
++    Ok(roots)
++}
++fn selected_roots(workspace: Workspace, input: &Input) -> Vec<Root> {
++    let members = workspace
++        .workspace_default_members
++        .unwrap_or(workspace.workspace_members);
++    workspace
++        .packages
++        .into_iter()
++        .filter(|p| members.contains(&p.id))
++        .flat_map(|p| {
++            p.targets
++                .into_iter()
++                .filter(|t| t.kind.iter().any(|k| input.library_types.contains(k)))
++                .map(move |t| Root {
++                    input: Some(input.id.clone()),
++                    manifest_path: p.manifest_path.clone(),
++                    package: p.name.clone(),
++                    library: t.name,
++                    features: input.features.clone(),
++                    default_features: input.default_features,
++                })
++        })
++        .collect()
++}
++fn library(target: &Target) -> bool {
++    target
++        .kind
++        .iter()
++        .any(|kind| ["lib", "rlib", "staticlib", "cdylib"].contains(&kind.as_str()))
++}
++fn key(package: &Package, target: &Target) -> String {
++    format!("{}@{}", target.name.replace('-', "_"), package.version)
++}
++fn graph(meta: &Metadata) -> BTreeMap<String, Vec<String>> {
++    let libs: BTreeSet<_> = meta
++        .packages
++        .iter()
++        .filter(|p| p.targets.iter().any(library))
++        .map(|p| &p.id)
++        .collect();
++    meta.resolve
++        .nodes
++        .iter()
++        .map(|node| {
++            (
++                node.id.clone(),
++                node.deps
++                    .iter()
++                    .filter(|dep| {
++                        libs.contains(&dep.pkg) && dep.dep_kinds.iter().any(|k| k.kind.is_none())
++                    })
++                    .map(|dep| dep.pkg.clone())
++                    .collect(),
++            )
++        })
++        .collect()
++}
++fn reachable(
++    root: &str,
++    roots: &BTreeSet<String>,
++    graph: &BTreeMap<String, Vec<String>>,
++) -> BTreeSet<String> {
++    let mut seen = BTreeSet::new();
++    let mut todo = vec![root.to_owned()];
++    while let Some(id) = todo.pop() {
++        if (id != root && roots.contains(&id)) || !seen.insert(id.clone()) {
++            continue;
++        }
++        todo.extend(graph.get(&id).into_iter().flatten().cloned());
++    }
++    seen
++}
++fn rustler<'a>(meta: &'a Metadata) -> Result<&'a Package> {
++    let ids = reachable(&meta.resolve.root, &BTreeSet::new(), &graph(meta));
++    let packages: Vec<_> = meta
++        .packages
++        .iter()
++        .filter(|p| p.name == "rustler" && ids.contains(&p.id))
++        .collect();
++    if packages.len() != 1 {
++        return Err(format!(
++            "bundle requires exactly one Rustler runtime; found {}",
++            packages.len()
++        )
++        .into());
++    }
++    let package = packages[0];
++    if !package.features.contains_key("nif_crate_isolation") {
++        return Err(format!(
++            "Rustler {} does not support nif_crate_isolation",
++            package.version
++        )
++        .into());
++    }
++    Ok(package)
++}
++
++// Preserve Cargo's source identity, including a git reference's kind and value.
++fn rustler_dependency(package: &Package) -> Result<(String, String)> {
++    let mut dependency = format!("\n[dependencies.rustler_runtime]\npackage = \"rustler\"\nversion = {}\ndefault-features = false\nfeatures = [\"nif_crate_isolation\"]\n", quoted(&format!("={}", package.version)));
++    let mut config = String::new();
++    match package.source.as_deref() {
++        None => dependency.push_str(&format!(
++            "path = {}\n",
++            quoted(
++                package
++                    .manifest_path
++                    .parent()
++                    .ok_or("invalid Rustler manifest")?
++                    .to_str()
++                    .ok_or("non UTF-8 path")?
++            )
++        )),
++        Some("registry+https://github.com/rust-lang/crates.io-index") => {}
++        Some(source) if source.starts_with("registry+") => {
++            dependency.push_str("registry = \"rustler_bundle_registry\"\n");
++            config = format!(
++                "[registries.rustler_bundle_registry]\nindex = {}\n",
++                quoted(&source[9..])
++            );
++        }
++        Some(source) if source.starts_with("git+") => {
++            let location = source[4..].split('#').next().unwrap();
++            let (url, query) = location.split_once('?').unwrap_or((location, ""));
++            dependency.push_str(&format!("git = {}\n", quoted(url)));
++            for pair in query.split('&').filter(|p| !p.is_empty()) {
++                let (name, value) = pair.split_once('=').ok_or("invalid git reference")?;
++                if !["branch", "tag", "rev"].contains(&name) {
++                    return Err("unsupported git reference".into());
++                }
++                dependency.push_str(&format!("{name} = {}\n", quoted(&decode_query(value)?)));
++            }
++        }
++        Some(source) => return Err(format!("unsupported Rustler source: {source}").into()),
++    }
++    Ok((dependency, config))
++}
++fn decode_query(value: &str) -> Result<String> {
++    let mut decoded = Vec::new();
++    let mut bytes = value.bytes();
++    while let Some(byte) = bytes.next() {
++        decoded.push(match byte {
++            b'+' => b' ',
++            b'%' => {
++                let hex = [
++                    bytes.next().ok_or("invalid URL escape")?,
++                    bytes.next().ok_or("invalid URL escape")?,
++                ];
++                u8::from_str_radix(std::str::from_utf8(&hex)?, 16)?
++            }
++            other => other,
++        });
++    }
++    Ok(String::from_utf8(decoded)?)
++}
++
++fn ownership(meta: &Metadata, roots: &[Root]) -> Result<Vec<Ownership>> {
++    let graph = graph(meta);
++    let mut entries = BTreeMap::new();
++    for root in roots {
++        let matches: Vec<_> = meta
++            .packages
++            .iter()
++            .filter(|p| p.name == root.package && p.manifest_path == root.manifest_path)
++            .flat_map(|p| {
++                p.targets
++                    .iter()
++                    .filter(move |t| t.name == root.library && library(t))
++                    .map(move |t| (p, t))
++            })
++            .collect();
++        if matches.len() != 1 {
++            return Err(format!(
++                "cannot resolve NIF library {} from {}",
++                root.library,
++                root.manifest_path.display()
++            )
++            .into());
++        }
++        let (package, target) = matches[0];
++        if !target
++            .kind
++            .iter()
++            .any(|k| ["lib", "rlib"].contains(&k.as_str()))
++        {
++            return Err(format!("NIF library {} requires lib or rlib output", root.library).into());
++        }
++        entries.insert(package.id.clone(), key(package, target));
++    }
++    let root_ids = entries.keys().cloned().collect();
++    let all_ids: BTreeSet<_> = entries
++        .keys()
++        .flat_map(|id| reachable(id, &BTreeSet::new(), &graph))
++        .collect();
++    let mut identities = BTreeMap::new();
++    for package in meta.packages.iter().filter(|p| all_ids.contains(&p.id)) {
++        for target in package.targets.iter().filter(|t| library(t)) {
++            if let Some(previous) = identities.insert(key(package, target), &package.id) {
++                if previous != &package.id {
++                    return Err(format!("ambiguous crate identity {}", key(package, target)).into());
++                }
++            }
++        }
++    }
++    let mut pairs = BTreeSet::new();
++    for (id, owner) in entries {
++        let ids = reachable(&id, &root_ids, &graph);
++        for package in meta
++            .packages
++            .iter()
++            .filter(|p| ids.contains(&p.id) && p.id != id)
++        {
++            for target in package.targets.iter().filter(|t| library(t)) {
++                pairs.insert(Ownership {
++                    source: key(package, target),
++                    owner: owner.clone(),
++                });
++            }
++        }
++    }
++    Ok(pairs.into_iter().collect())
++}
++
++fn prepare(spec: &Spec, roots: &[Root]) -> Result<Bundle> {
++    let mut bundle = Bundle {
++        schema: 1,
++        manifest_path: spec.out_dir.join("Cargo.toml"),
++        ownership_path: spec.out_dir.join("src/ownership.rs"),
++        package: "rustler_nif_bundle",
++        library: "rustler_nif_bundle",
++        archive: None,
++        entries: Vec::new(),
++        ownership: Vec::new(),
++        workspace_inputs: Vec::new(),
++    };
++    if roots.is_empty() {
++        return Ok(bundle);
++    }
++    fs::create_dir_all(&spec.out_dir)?;
++    let policy = workspace::Policy::load(spec, roots)?;
++    let mut names = BTreeSet::new();
++    let mut manifest = "# Generated by rustler-bundler; do not edit.\n[package]\nname = \"rustler_nif_bundle\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[lib]\ncrate-type = [\"staticlib\"]\n".to_owned();
++    if !policy.has_workspace() { manifest.push_str("\n[workspace]\n"); }
++    // Workspace policy precedes [package] so cargo-features remains a root key.
++    manifest = policy.manifest()? + &manifest;
++    let mut source = String::new();
++    for (index, root) in roots.iter().enumerate() {
++        if !root.manifest_path.is_absolute() {
++            return Err("root manifest_path must be absolute".into());
++        }
++        if !names.insert(root.library.replace('-', "_")) {
++            return Err("NIF library names must be unique".into());
++        }
++        if root.features.iter().any(|f| f.contains('/')) {
++            return Err("configure unqualified features on each NIF root".into());
++        }
++        let dir = root
++            .manifest_path
++            .parent()
++            .ok_or("invalid NIF manifest path")?
++            .to_str()
++            .ok_or("non UTF-8 path")?;
++        manifest.push_str(&format!("\n[dependencies.nif_{index}]\npackage = {}\npath = {}\ndefault-features = {}\nfeatures = [{}]\n",
++            quoted(&root.package), quoted(dir), root.default_features,
++            root.features.iter().map(|f| quoted(f)).collect::<Vec<_>>().join(", ")));
++        source.push_str(&format!("extern crate nif_{index};\n"));
++    }
++    let manifest_path = spec.out_dir.join("Cargo.toml");
++    write_changed(&manifest_path, &manifest)?;
++    // Seed Cargo's library target once. Keep the final source intact during repeated
++    // metadata passes; out_dir is generator-owned, not a custom source extension.
++    if !spec.out_dir.join("src/lib.rs").exists() {
++        write_changed(&spec.out_dir.join("src/lib.rs"), &source)?;
++    }
++    // Clear configuration generated by earlier prepares before resolving again.
++    let config_path = spec.out_dir.join(".cargo/config.toml");
++    write_changed(
++        &config_path,
++        "# Generated by rustler-bundler; do not edit.\n",
++    )?;
++    policy.seed_lock(&spec.out_dir)?;
++    let initial = metadata(spec)?;
++    let runtime = rustler(&initial)?;
++    let (dependency, config) = rustler_dependency(runtime)?;
++    write_changed(&manifest_path, &(manifest + &dependency))?;
++    write_changed(
++        &config_path,
++        &format!("# Generated by rustler-bundler; do not edit.\n{config}"),
++    )?;
++    let final_meta = policy.reconcile(spec, metadata(spec)?)?;
++    if rustler(&final_meta)?.id != runtime.id {
++        return Err("aggregate Rustler dependency did not unify with NIF dependencies".into());
++    }
++    if !final_meta.resolve.nodes.iter().any(|node| {
++        node.id == runtime.id && node.features.iter().any(|f| f == "nif_crate_isolation")
++    }) {
++        return Err("aggregate Rustler runtime did not enable nif_crate_isolation".into());
++    }
++    let ownership = ownership(&final_meta, roots)?;
++    let records = format!("// Generated by rustler-bundler; do not edit.\nrustler_runtime::nif_crate_owners! {{\n{}}}\n", ownership.iter()
++        .map(|p| format!("    {:?} => {:?},\n", p.source, p.owner)).collect::<String>());
++    let ownership_path = spec.out_dir.join("src/ownership.rs");
++    write_changed(&ownership_path, &records)?;
++    source.push_str("include!(\"ownership.rs\");\n");
++    write_changed(&spec.out_dir.join("src/lib.rs"), &source)?;
++    bundle.workspace_inputs = policy.inputs;
++    bundle.entries = roots
++        .iter()
++        .map(|r| {
++            let library = r.library.replace('-', "_");
++            Entry {
++                input: r.input.clone(),
++                init: format!("{library}_nif_init"),
++                library,
++            }
++        })
++        .collect();
++    bundle.ownership = ownership;
++    Ok(bundle)
++}
++fn build(spec: &Spec, bundle: &Bundle) -> Result<PathBuf> {
++    let mut command = cargo(spec)?;
++    command.args(["build", "--locked", "--message-format=json-diagnostic-short"]);
++    if spec.release {
++        command.arg("--release");
++    }
++    if spec.offline {
++        command.arg("--offline");
++    }
++    if let Some(target) = &spec.target {
++        command.args(["--target", target]);
++    }
++    if let Some(dir) = &spec.target_dir {
++        command.arg("--target-dir").arg(dir);
++    }
++    let mut child = command
++        .stdout(Stdio::piped())
++        .stderr(Stdio::inherit())
++        .spawn()?;
++    let mut archive = None;
++    let output = (|| -> Result<()> {
++        for line in io::BufReader::new(child.stdout.take().ok_or("missing Cargo output")?).lines() {
++            let line = line?;
++            match serde_json::from_str::<serde_json::Value>(&line) {
++                Ok(message) if message.is_object() => {
++                    if let Some(path) = bundle_archive(&message, bundle) {
++                        archive = Some(path);
++                    }
++                    println!("{line}");
++                }
++                // Proc macros and compiler wrappers may write arbitrary stdout.
++                // Keep our stdout JSON-only for build-system streaming decoders.
++                _ => eprintln!("{line}"),
++            }
++        }
++        Ok(())
++    })();
++    // Reap Cargo even if reading its output fails.
++    let status = child.wait()?;
++    output?;
++    if !status.success() {
++        return Err(format!("cargo build failed ({status})").into());
++    }
++    let archive = archive.ok_or("cargo produced no bundle archive")?;
++    if !archive.is_file() {
++        return Err("cargo reported a missing bundle archive".into());
++    }
++    Ok(archive)
++}
++
++fn bundle_archive(message: &serde_json::Value, bundle: &Bundle) -> Option<PathBuf> {
++    if message["reason"] != "compiler-artifact"
++        || message["manifest_path"].as_str() != bundle.manifest_path.to_str()
++        || message["target"]["name"] != bundle.library
++        || message["target"]["kind"] != serde_json::json!(["staticlib"])
++    {
++        return None;
++    }
++    message["filenames"]
++        .as_array()?
++        .iter()
++        .filter_map(|f| f.as_str())
++        .find(|f| f.ends_with(".a") || f.ends_with(".lib"))
++        .map(PathBuf::from)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn archive_requires_generated_manifest_identity() {
++        let spec: Spec = serde_json::from_value(serde_json::json!({
++            "schema": 1, "out_dir": "/bundle"
++        }))
++        .unwrap();
++        let bundle = prepare(&spec, &[]).unwrap();
++        let mut artifact = serde_json::json!({
++            "reason": "compiler-artifact", "manifest_path": "/dependency/Cargo.toml",
++            "target": {"name": "rustler_nif_bundle", "kind": ["staticlib"]},
++            "filenames": ["/dependency/bundle.a"]
++        });
++        assert!(bundle_archive(&artifact, &bundle).is_none());
++        artifact["manifest_path"] = serde_json::json!(bundle.manifest_path);
++        assert_eq!(
++            bundle_archive(&artifact, &bundle),
++            Some(PathBuf::from("/dependency/bundle.a"))
++        );
++    }
++    fn package(id: &str) -> Package {
++        Package {
++            id: id.into(),
++            name: id.into(),
++            version: "1.0.0".into(),
++            source: None,
++            manifest_path: PathBuf::from(format!("/{id}/Cargo.toml")),
++            targets: vec![Target {
++                name: id.into(),
++                kind: vec!["lib".into()],
++            }],
++            features: BTreeMap::new(),
++        }
++    }
++    fn node(id: &str, deps: &[(&str, Option<&str>)]) -> Node {
++        Node {
++            id: id.into(),
++            features: vec![],
++            deps: deps
++                .iter()
++                .map(|(pkg, kind)| Dep {
++                    pkg: (*pkg).into(),
++                    dep_kinds: vec![DepKind {
++                        kind: kind.map(String::from),
++                    }],
++                })
++                .collect(),
++        }
++    }
++    fn root(id: &str) -> Root {
++        Root {
++            input: None,
++            package: id.into(),
++            library: id.into(),
++            manifest_path: PathBuf::from(format!("/{id}/Cargo.toml")),
++            features: vec![],
++            default_features: true,
++        }
++    }
++    #[test]
++    fn helpers_stop_at_nif_boundaries_and_exclude_host_dependencies() {
++        let mut proc_macro = package("macro");
++        proc_macro.targets[0].kind = vec!["proc-macro".into()];
++        let meta = Metadata {
++            packages: vec![
++                package("one"),
++                package("two"),
++                package("helper"),
++                package("other"),
++                package("shared"),
++                package("build"),
++                package("dev"),
++                proc_macro,
++            ],
++            resolve: Resolve {
++                root: "one".into(),
++                nodes: vec![
++                    node(
++                        "one",
++                        &[
++                            ("two", None),
++                            ("helper", None),
++                            ("shared", None),
++                            ("build", Some("build")),
++                            ("dev", Some("dev")),
++                            ("macro", None),
++                        ],
++                    ),
++                    node("two", &[("other", None), ("shared", None)]),
++                ],
++            },
++        };
++        let pairs = ownership(&meta, &[root("one"), root("two")]).unwrap();
++        let expected = [
++            ("helper", "one"),
++            ("other", "two"),
++            ("shared", "one"),
++            ("shared", "two"),
++        ]
++        .map(|(source, owner)| Ownership {
++            source: format!("{source}@1.0.0"),
++            owner: format!("{owner}@1.0.0"),
++        });
++        assert_eq!(pairs, expected);
++    }
++    #[test]
++    fn reject_ambiguous_sources_and_non_linkable_nifs() {
++        let mut duplicate = package("helper");
++        duplicate.id = "different-source".into();
++        let mut meta = Metadata {
++            packages: vec![package("one"), package("helper"), duplicate],
++            resolve: Resolve {
++                root: "one".into(),
++                nodes: vec![node("one", &[("helper", None), ("different-source", None)])],
++            },
++        };
++        assert!(ownership(&meta, &[root("one")])
++            .unwrap_err()
++            .to_string()
++            .contains("ambiguous"));
++        meta.packages[0].targets[0].kind = vec!["cdylib".into()];
++        assert!(ownership(&meta, &[root("one")])
++            .unwrap_err()
++            .to_string()
++            .contains("rlib"));
++    }
++    #[test]
++    fn preserve_rustler_source_identity() {
++        let mut runtime = package("rustler");
++        let (path, _) = rustler_dependency(&runtime).unwrap();
++        assert!(path.contains("path = \"/rustler\""));
++        runtime.source =
++            Some("git+https://example.invalid/rustler?branch=support%2Ftest#abcdef".into());
++        let (git, _) = rustler_dependency(&runtime).unwrap();
++        assert!(git.contains("branch = \"support/test\""));
++        assert!(!git.contains("abcdef"));
++        runtime.source = Some("registry+sparse+https://example.invalid/index/".into());
++        let (registry, config) = rustler_dependency(&runtime).unwrap();
++        assert!(registry.contains("registry = \"rustler_bundle_registry\""));
++        assert!(config.contains("sparse+https://example.invalid/index/"));
++    }
++    #[test]
++    fn reject_multiple_or_unpatched_runtime_packages() {
++        let mut runtime = package("rustler");
++        let mut meta = Metadata {
++            packages: vec![package("one"), runtime],
++            resolve: Resolve {
++                root: "one".into(),
++                nodes: vec![node("one", &[("rustler", None)])],
++            },
++        };
++        assert!(rustler(&meta)
++            .err()
++            .unwrap()
++            .to_string()
++            .contains("does not support"));
++        meta.packages[1]
++            .features
++            .insert("nif_crate_isolation".into(), vec![]);
++        assert!(rustler(&meta).is_ok());
++        runtime = package("rustler");
++        runtime.id = "other-runtime".into();
++        meta.packages.push(runtime);
++        meta.resolve.nodes[0] = node("one", &[("rustler", None), ("other-runtime", None)]);
++        assert!(rustler(&meta)
++            .err()
++            .unwrap()
++            .to_string()
++            .contains("exactly one"));
++    }
++}
+diff --git a/rustler_bundler/src/workspace.rs b/rustler_bundler/src/workspace.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a62822513ce6671bded8e9c8ee7e48e15f30ad84
+--- /dev/null
++++ b/rustler_bundler/src/workspace.rs
+@@ -0,0 +1,271 @@
++//! Preserve the owning workspace's settings and committed dependency choices.
++
++use super::{
++    cargo, metadata, metadata_command, read_metadata, Metadata, Result, Root, Spec, Workspace,
++};
++use std::collections::{BTreeMap, BTreeSet};
++use std::fs;
++use std::path::{Path, PathBuf};
++use toml::{Table, Value};
++
++pub(super) struct Policy {
++    pub inputs: Vec<PathBuf>,
++    settings: Table,
++    lock: Option<String>,
++    preferred: BTreeMap<(String, String), BTreeSet<(String, String)>>,
++    owners: BTreeSet<PathBuf>,
++}
++
++fn workspace(spec: &Spec, manifest: &Path) -> Result<Workspace> {
++    if !manifest.is_absolute() {
++        return Err("workspace manifest must be absolute".into());
++    }
++    let mut command = metadata_command(spec)?;
++    command
++        .current_dir(manifest.parent().ok_or("manifest has no parent")?)
++        .args(["--no-deps", "--manifest-path"])
++        .arg(manifest);
++    read_metadata(command)
++}
++
++impl Policy {
++    pub fn load(spec: &Spec, roots: &[Root]) -> Result<Self> {
++        let mut policy = Self {
++            inputs: Vec::new(),
++            settings: Table::new(),
++            lock: None,
++            preferred: BTreeMap::new(),
++            owners: BTreeSet::new(),
++        };
++        let mut workspaces = BTreeSet::new();
++        if let Some(manifest) = &spec.workspace_manifest {
++            let owner = workspace(spec, manifest)?;
++            let root = owner.workspace_root;
++            let manifest = root.join("Cargo.toml");
++            let data: Table = toml::from_str(&fs::read_to_string(&manifest)?)?;
++            for name in ["cargo-features", "profile", "patch", "replace"] {
++                if let Some(value) = data.get(name) {
++                    let mut value = value.clone();
++                    if name == "patch" || name == "replace" {
++                        rebase_paths(&mut value, &root);
++                    }
++                    policy.settings.insert(name.into(), value);
++                }
++            }
++            let resolver = data
++                .get("workspace")
++                .and_then(|v| v.get("resolver"))
++                .or_else(|| data.get("package").and_then(|p| p.get("resolver")))
++                .cloned()
++                .unwrap_or_else(|| {
++                    Value::String(
++                        match data.get("package").and_then(|p| p.get("edition")).and_then(
++                            |edition| {
++                                edition.as_str().or_else(|| {
++                                    edition
++                                        .get("workspace")
++                                        .and_then(Value::as_bool)
++                                        .filter(|v| *v)
++                                        .and_then(|_| {
++                                            data.get("workspace")?
++                                                .get("package")?
++                                                .get("edition")?
++                                                .as_str()
++                                        })
++                                })
++                            },
++                        ) {
++                            Some("2024") => "3",
++                            Some("2021") => "2",
++                            _ => "1",
++                        }
++                        .into(),
++                    )
++                });
++            policy.settings.insert(
++                "workspace".into(),
++                Value::Table([("resolver".into(), resolver)].into_iter().collect()),
++            );
++            policy
++                .owners
++                .extend(owner.packages.into_iter().map(|p| p.manifest_path));
++            policy.read_lock(&root)?;
++            policy.inputs.extend([manifest, root.join("Cargo.lock")]);
++            workspaces.insert(root);
++        }
++        for input in roots {
++            let root = workspace(spec, &input.manifest_path)?.workspace_root;
++            if workspaces.insert(root.clone()) {
++                policy.inputs.push(root.join("Cargo.toml"));
++            }
++        }
++        Ok(policy)
++    }
++
++    fn read_lock(&mut self, root: &Path) -> Result<()> {
++        let path = root.join("Cargo.lock");
++        let text = match fs::read_to_string(&path) {
++            Ok(text) => text,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
++            Err(e) => return Err(e.into()),
++        };
++        let data: Table = toml::from_str(&text)?;
++        if !matches!(data.get("version").and_then(Value::as_integer), Some(3 | 4)) {
++            return Err(format!("unsupported Cargo.lock version in {}", path.display()).into());
++        }
++        for package in data
++            .get("package")
++            .and_then(Value::as_array)
++            .ok_or("lockfile has no package list")?
++        {
++            if let Some(source) = package.get("source").and_then(Value::as_str) {
++                let name = package["name"].as_str().ok_or("lock package has no name")?;
++                let version = package["version"]
++                    .as_str()
++                    .ok_or("lock package has no version")?;
++                self.preferred
++                    .entry((name.into(), source_family(source)))
++                    .or_default()
++                    .insert((version.into(), source.into()));
++            }
++        }
++        self.lock = Some(text);
++        Ok(())
++    }
++
++    pub fn manifest(&self) -> Result<String> {
++        if self.settings.is_empty() {
++            return Ok(String::new());
++        }
++        // The generated [workspace] header is supplied here when a primary
++        // workspace exists, so its resolver is retained as well as its profiles.
++        Ok(toml::to_string_pretty(&self.settings)?)
++    }
++
++    pub fn has_workspace(&self) -> bool {
++        self.settings.contains_key("workspace")
++    }
++
++    pub fn seed_lock(&self, out: &Path) -> Result<()> {
++        // A coherent application lock seeds resolution. Library locks cannot be
++        // merged: their dependency edges may pin incompatible resolutions even
++        // when the manifests have compatible requirements.
++        if let Some(lock) = &self.lock {
++            super::write_changed(&out.join("Cargo.lock"), lock)?;
++        }
++        Ok(())
++    }
++
++    pub fn reconcile(&self, spec: &Spec, mut meta: Metadata) -> Result<Metadata> {
++        let mut attempted = BTreeSet::new();
++        loop {
++            let mut reachable = self
++                .owners
++                .iter()
++                .flat_map(|manifest| {
++                    meta.packages
++                        .iter()
++                        .filter(move |p| &p.manifest_path == manifest)
++                        .map(|p| p.id.clone())
++                })
++                .collect::<BTreeSet<_>>();
++            let mut queue = reachable.iter().cloned().collect::<Vec<_>>();
++            while let Some(id) = queue.pop() {
++                if let Some(node) = meta.resolve.nodes.iter().find(|n| n.id == id) {
++                    for dep in &node.deps {
++                        if dep
++                            .dep_kinds
++                            .iter()
++                            .any(|k| k.kind.as_deref() != Some("dev"))
++                            && reachable.insert(dep.pkg.clone())
++                        {
++                            queue.push(dep.pkg.clone());
++                        }
++                    }
++                }
++            }
++            let conflict = meta
++                .packages
++                .iter()
++                .filter(|p| reachable.contains(&p.id))
++                .find_map(|p| {
++                    let source = p.source.as_ref()?;
++                    let versions = self
++                        .preferred
++                        .get(&(p.name.clone(), source_family(source)))?;
++                    (!versions.contains(&(p.version.clone(), source.clone())))
++                        .then_some((p, versions))
++                });
++            let Some((package, versions)) = conflict else {
++                return Ok(meta);
++            };
++            if !attempted.insert(package.id.clone()) {
++                return Err(format!(
++                    "cannot preserve owning Cargo.lock: conflicting input lock choices for {}; update the owning Cargo.lock",
++                    package.name
++                )
++                .into());
++            }
++            let locked = fs::read(spec.out_dir.join("Cargo.lock"))?;
++            let mut resolved = false;
++            for (version, source) in versions {
++                let precise = if source.starts_with("git+") {
++                    source
++                        .rsplit_once('#')
++                        .ok_or("git lock source has no revision")?
++                        .1
++                } else {
++                    version
++                };
++                let mut command = cargo(spec)?;
++                command.args([
++                    "update",
++                    "--package",
++                    &format!("{}@{}", package.name, package.version),
++                    "--precise",
++                    precise,
++                ]);
++                if spec.offline {
++                    command.arg("--offline");
++                }
++                let output = command.output()?;
++                if output.status.success() {
++                    resolved = true;
++                    break;
++                }
++                fs::write(spec.out_dir.join("Cargo.lock"), &locked)?;
++            }
++            if !resolved {
++                return Err(format!("cannot preserve owning Cargo.lock: {} is locked to {:?}, but the combined NIF graph requires {}; update compatible requirements and the owning lockfile",
++                    package.name, versions, package.version).into());
++            }
++            meta = metadata(spec)?;
++        }
++    }
++}
++
++fn rebase_paths(value: &mut Value, root: &Path) {
++    if let Some(table) = value.as_table_mut() {
++        if let Some(Value::String(path)) = table.get_mut("path") {
++            if Path::new(path).is_relative() {
++                *path = root.join(&*path).to_string_lossy().into_owned();
++            }
++        }
++        for (_, child) in table.iter_mut() {
++            rebase_paths(child, root);
++        }
++    }
++}
++
++// Git lock sources include the resolved revision; compare choices within the
++// same repository/reference so an updated revision cannot escape lock checks.
++fn source_family(source: &str) -> String {
++    if source.starts_with("git+") {
++        source
++            .rsplit_once('#')
++            .map_or(source, |(repository, _)| repository)
++            .into()
++    } else {
++        source.into()
++    }
++}
+diff --git a/rustler_bundler/tests/cli.rs b/rustler_bundler/tests/cli.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..22ee7bee9fc5ed2ad52a303181181a55a42b8c08
+--- /dev/null
++++ b/rustler_bundler/tests/cli.rs
+@@ -0,0 +1,283 @@
++use serde_json::{json, Value};
++use std::fs;
++use std::path::{Path, PathBuf};
++use std::process::{Command, Output};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++struct Fixture(PathBuf);
++impl Fixture {
++    fn new() -> Self {
++        let stamp = SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .unwrap()
++            .as_nanos();
++        let root =
++            std::env::temp_dir().join(format!("rustler bundle {} {stamp}", std::process::id()));
++        fs::create_dir_all(&root).unwrap();
++        Self(root)
++    }
++    fn write(&self, path: impl AsRef<Path>, text: &str) {
++        let path = self.0.join(path);
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        fs::write(path, text).unwrap();
++    }
++    fn run(&self, mode: &str, spec: &Value) -> Output {
++        self.write("bundle.json", &spec.to_string());
++        Command::new(env!("CARGO_BIN_EXE_rustler-bundler"))
++            .args([mode, "--spec"])
++            .arg(self.0.join("bundle.json"))
++            .current_dir(&self.0)
++            .output()
++            .unwrap()
++    }
++}
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        let _ = fs::remove_dir_all(&self.0);
++    }
++}
++fn messages(output: &Output) -> Vec<Value> {
++    String::from_utf8_lossy(&output.stdout)
++        .lines()
++        .map(|line| serde_json::from_str(line).unwrap())
++        .collect()
++}
++
++#[test]
++fn workspace_build_preserves_selection_features_ids_and_diagnostics() {
++    let fixture = Fixture::new();
++    let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
++        .parent()
++        .unwrap()
++        .join("rustler");
++    // JSON string escaping is also valid for the ordinary paths used here in TOML.
++    let runtime = serde_json::to_string(&runtime).unwrap();
++    fixture.write("Cargo.toml", "[workspace]\nresolver=\"2\"\nmembers=[\"one\",\"two\",\"unused\"]\ndefault-members=[\"one\",\"two\"]\n");
++    for name in ["one", "two", "unused"] {
++        let helper = if name == "one" {
++            "helper={path=\"../helper\"}\n"
++        } else {
++            ""
++        };
++        let kinds = if name == "unused" {
++            "[\"cdylib\"]"
++        } else {
++            "[\"rlib\",\"cdylib\"]"
++        };
++        fixture.write(format!("{name}/Cargo.toml"), &format!(
++            "[package]\nname=\"{name}\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\ncrate-type={kinds}\n[features]\ndefault=[\"default_marker\"]\ndefault_marker=[]\nenabled=[]\n[dependencies]\nrustler={{path={runtime}}}\n{helper}"));
++        fixture.write(format!("{name}/src/lib.rs"), &format!(
++            "#[cfg(feature=\"default_marker\")] compile_error!(\"default features were not disabled\");\n#[cfg(not(feature=\"enabled\"))] compile_error!(\"input feature was not enabled\");\n{}#[rustler::nif]\nfn value()->u64 {{ 42 }}\nrustler::init!(\"{name}\");\n",
++            if name == "one" { "extern crate helper;\n" } else { "" }));
++    }
++    fixture.write("helper/Cargo.toml", &format!("[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[dependencies]\nrustler={{path={runtime}}}\n"));
++    fixture.write(
++        "noise/Cargo.toml",
++        "[package]\nname=\"noise\"\nversion=\"0.1.0\"\nedition=\"2021\"\n[lib]\nproc-macro=true\n",
++    );
++    fixture.write("noise/src/lib.rs", "extern crate proc_macro;\n#[proc_macro]\npub fn noise(input: proc_macro::TokenStream) -> proc_macro::TokenStream { println!(\"bundler plain stdout marker\"); input }\n");
++    fixture.write(
++        "helper/src/lib.rs",
++        "#[rustler::nif]\nfn helper_value()->u64 { 99 }\n",
++    );
++    let mut spec = json!({"schema":1, "out_dir":fixture.0.join("generated bundle"),
++        "target_dir":fixture.0.join("cargo target"), "inputs":[{"id":"workspace", "manifest_path":fixture.0.join("Cargo.toml"),
++        "features":["enabled"], "default_features":false}]});
++    let output = fixture.run("build", &spec);
++    assert!(
++        output.status.success(),
++        "{}",
++        String::from_utf8_lossy(&output.stderr)
++    );
++    let result = messages(&output).pop().unwrap();
++    assert!(Path::new(result["archive"].as_str().unwrap()).is_file());
++    assert_eq!(
++        result["entries"],
++        json!([
++        {"input":"workspace","library":"one","init":"one_nif_init"},
++        {"input":"workspace","library":"two","init":"two_nif_init"}])
++    );
++    assert!(result["ownership"]
++        .as_array()
++        .unwrap()
++        .contains(&json!({"source":"helper@0.1.0","owner":"one@0.1.0"})));
++    assert!(!result["ownership"]
++        .as_array()
++        .unwrap()
++        .contains(&json!({"source":"helper@0.1.0","owner":"two@0.1.0"})));
++
++    // A successful repeated prepare must not rewrite unchanged generated source.
++    let generated = fixture.0.join("generated bundle/src/lib.rs");
++    let modified = fs::metadata(&generated).unwrap().modified().unwrap();
++    let prepared = fixture.run("prepare", &spec);
++    assert!(
++        prepared.status.success(),
++        "{}",
++        String::from_utf8_lossy(&prepared.stderr)
++    );
++    assert_eq!(
++        modified,
++        fs::metadata(&generated).unwrap().modified().unwrap()
++    );
++
++    // Proc-macro stdout must reach stderr without corrupting the JSON protocol.
++    let helper_manifest = fixture.0.join("helper/Cargo.toml");
++    let manifest = fs::read_to_string(&helper_manifest).unwrap();
++    fixture.write(
++        "helper/Cargo.toml",
++        &(manifest + "noise={path=\"../noise\"}\n"),
++    );
++    fixture.write(
++        "helper/src/lib.rs",
++        "noise::noise! { #[rustler::nif] fn helper_value()->u64 { 99 } }\n",
++    );
++    let noisy = fixture.run("build", &spec);
++    assert!(
++        noisy.status.success(),
++        "{}",
++        String::from_utf8_lossy(&noisy.stderr)
++    );
++    assert!(String::from_utf8_lossy(&noisy.stderr).contains("bundler plain stdout marker"));
++    assert!(messages(&noisy)
++        .iter()
++        .any(|m| m["reason"] == "rustler-bundle"));
++
++    let mut invalid = spec.clone();
++    invalid["inputs"][0]["input"] = json!("misspelled id");
++    let rejected = fixture.run("prepare", &invalid);
++    assert!(!rejected.status.success());
++    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown field"));
++
++    // Empty selections must not return an archive from an earlier successful build.
++    spec["inputs"][0]["library_types"] = json!(["bin"]);
++    let empty = fixture.run("build", &spec);
++    assert!(empty.status.success());
++    assert_eq!(messages(&empty).len(), 1);
++    let result = messages(&empty).pop().unwrap();
++    assert_eq!(result["entries"], json!([]));
++    assert!(result["archive"].is_null());
++    spec["inputs"][0]
++        .as_object_mut()
++        .unwrap()
++        .remove("library_types");
++
++    // Cargo errors must retain their JSON diagnostics and fail the overall operation.
++    fixture.write(
++        "one/src/lib.rs",
++        "compile_error!(\"bundle diagnostic marker\");\n",
++    );
++    let failure = fixture.run("build", &spec);
++    assert!(!failure.status.success());
++    assert!(messages(&failure)
++        .iter()
++        .any(|m| m["reason"] == "compiler-message"
++            && m["message"]["rendered"]
++                .as_str()
++                .unwrap_or("")
++                .contains("bundle diagnostic marker")));
++    assert!(!messages(&failure)
++        .iter()
++        .any(|m| m["reason"] == "rustler-bundle"));
++
++    // Rejected input contracts fail before an archive/result can be consumed.
++    let mut invalid = spec.clone();
++    invalid["inputs"][0]["features"] = json!(["one/enabled"]);
++    let rejected = fixture.run("prepare", &invalid);
++    assert!(!rejected.status.success());
++    assert!(String::from_utf8_lossy(&rejected.stderr).contains("unqualified"));
++    invalid = spec.clone();
++    let duplicate = invalid["inputs"][0].clone();
++    invalid["inputs"].as_array_mut().unwrap().push(duplicate);
++    let rejected = fixture.run("prepare", &invalid);
++    assert!(!rejected.status.success());
++    assert!(String::from_utf8_lossy(&rejected.stderr).contains("duplicate input id"));
++
++    // Explicit roots remain usable by clients that already know their packages.
++    spec.as_object_mut().unwrap().remove("inputs");
++    spec["roots"] = json!([{"manifest_path":fixture.0.join("one/Cargo.toml"),
++        "package":"one", "library":"one", "features":["enabled"], "default_features":false}]);
++    let mut invalid = spec.clone();
++    let duplicate = invalid["roots"][0].clone();
++    invalid["roots"].as_array_mut().unwrap().push(duplicate);
++    let rejected = fixture.run("prepare", &invalid);
++    assert!(!rejected.status.success());
++    assert!(String::from_utf8_lossy(&rejected.stderr).contains("library names must be unique"));
++    invalid["roots"] = json!([{"manifest_path":fixture.0.join("unused/Cargo.toml"),
++        "package":"unused", "library":"unused", "features":["enabled"], "default_features":false}]);
++    let rejected = fixture.run("prepare", &invalid);
++    assert!(!rejected.status.success());
++    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires lib or rlib"));
++    let manual = fixture.run("prepare", &spec);
++    assert!(manual.status.success());
++    assert_eq!(
++        messages(&manual).pop().unwrap()["entries"],
++        json!([{"library":"one","init":"one_nif_init"}])
++    );
++}
++
++#[test]
++fn owning_workspace_policy_preserves_profiles_patches_and_locks() {
++    let fixture = Fixture::new();
++    let runtime = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("rustler");
++    let runtime = serde_json::to_string(&runtime).unwrap();
++    // Two releases in an offline registry expose accidental lockfile upgrades.
++    let release = |version: &str, value: u32| {
++        fixture.write(format!("vendor/policy_versioned-{version}/Cargo.toml"), &format!(
++            "[package]\nname='policy_versioned'\nversion='{version}'\nedition='2021'\n"));
++        fixture.write(format!("vendor/policy_versioned-{version}/src/lib.rs"),
++            &format!("pub const VERSION: u32 = {value};\n"));
++        fixture.write(format!("vendor/policy_versioned-{version}/.cargo-checksum.json"),
++            &json!({"files":{}, "package":"0000000000000000000000000000000000000000000000000000000000000000"}).to_string());
++    };
++    release("1.0.0", 100);
++    fixture.write(".cargo/config.toml", &format!(
++        "[registries.policy]\nindex='https://policy.invalid/index'\n[source.policy]\nregistry='https://policy.invalid/index'\nreplace-with='policy-vendor'\n[source.policy-vendor]\ndirectory={}\n",
++        serde_json::to_string(&fixture.0.join("vendor")).unwrap()));
++    fixture.write("app/Cargo.toml", "[workspace]\nresolver='2'\nmembers=['nif']\n[profile.release]\ndebug-assertions=true\n[patch.crates-io]\npolicy_patch={path='patches/local'}\n");
++    fixture.write("app/patches/local/Cargo.toml", "[package]\nname='policy_patch'\nversion='1.0.0'\nedition='2021'\n");
++    fixture.write("app/patches/local/src/lib.rs", "pub const PATCHED: bool = true;\n");
++    fixture.write("app/nif/Cargo.toml", &format!(
++        "[package]\nname='policy_nif'\nversion='0.1.0'\nedition='2021'\n[lib]\ncrate-type=['rlib','cdylib']\n[dependencies]\nrustler={{path={runtime}}}\npolicy_patch='1'\npolicy_versioned={{version='1',registry='policy'}}\n"));
++    fixture.write("app/nif/src/lib.rs", "#[cfg(not(debug_assertions))] compile_error!(\"owning release profile was lost\");\nconst _: () = assert!(policy_patch::PATCHED && policy_versioned::VERSION == 100);\n#[rustler::nif] fn value()->u64 {42}\nrustler::init!(\"policy_nif\");\n");
++    let cargo_at = |directory: &str, args: &[&str]| {
++        let output = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
++            .args(args).current_dir(fixture.0.join(directory)).output().unwrap();
++        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
++    };
++    cargo_at("app", &["generate-lockfile", "--offline"]);
++    release("1.0.1", 101);
++    let lock = fs::read(fixture.0.join("app/Cargo.lock")).unwrap();
++    let original = fs::read(fixture.0.join("app/Cargo.toml")).unwrap();
++    let mut spec = json!({"schema":1,"release":true,"offline":true,
++        "workspace_manifest":fixture.0.join("app/Cargo.toml"),
++        "out_dir":fixture.0.join("generated"),"target_dir":fixture.0.join("target"),
++        "inputs":[{"id":"owner","manifest_path":fixture.0.join("app/nif/Cargo.toml")}]});
++    let output = fixture.run("build", &spec);
++    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
++    let result = messages(&output).pop().unwrap();
++    assert!(result["workspace_inputs"].as_array().unwrap().contains(&json!(fixture.0.join("app/Cargo.lock"))));
++    assert_eq!(lock, fs::read(fixture.0.join("app/Cargo.lock")).unwrap());
++    assert_eq!(original, fs::read(fixture.0.join("app/Cargo.toml")).unwrap());
++    let prepared = fixture.run("prepare", &spec);
++    assert!(prepared.status.success(), "{}", String::from_utf8_lossy(&prepared.stderr));
++    // Another application cannot silently force the owner's compatible locked
++    // version to move. Its own profile is not the executable's profile either.
++    fixture.write("other/Cargo.toml", &format!("[workspace]\n[package]\nname='policy_other'\nversion='0.1.0'\nedition='2021'\n[lib]\ncrate-type=['rlib','cdylib']\n[dependencies]\nrustler={{path={runtime}}}\npolicy_versioned={{version='1',registry='policy'}}\n[profile.release]\ndebug-assertions=false\n"));
++    fixture.write("other/src/lib.rs", "#[cfg(not(debug_assertions))] compile_error!(\"library profile overrode application\");\n#[rustler::nif] fn other()->u64 {42}\nrustler::init!(\"policy_other\");\n");
++    cargo_at("other", &["generate-lockfile", "--offline"]);
++    let library_lock = fs::read(fixture.0.join("other/Cargo.lock")).unwrap();
++    spec["inputs"].as_array_mut().unwrap().push(json!({"id":"other", "manifest_path":fixture.0.join("other/Cargo.toml")}));
++    let libraries = fixture.run("build", &spec);
++    assert!(libraries.status.success(), "{}", String::from_utf8_lossy(&libraries.stderr));
++    assert_eq!(library_lock, fs::read(fixture.0.join("other/Cargo.lock")).unwrap());
++    let manifest = fs::read_to_string(fixture.0.join("other/Cargo.toml")).unwrap();
++    fixture.write("other/Cargo.toml", &manifest.replace("version='1',registry", "version='=1.0.1',registry"));
++    let conflict = fixture.run("prepare", &spec);
++    assert!(!conflict.status.success());
++    assert!(String::from_utf8_lossy(&conflict.stderr).contains("cannot preserve owning Cargo.lock"), "{}", String::from_utf8_lossy(&conflict.stderr));
++    assert_eq!(lock, fs::read(fixture.0.join("app/Cargo.lock")).unwrap());
++    assert_eq!(library_lock, fs::read(fixture.0.join("other/Cargo.lock")).unwrap());
++    cargo_at("app", &["update", "--offline", "-p", "policy_versioned"]);
++    let compatible = fixture.run("prepare", &spec);
++    assert!(compatible.status.success(), "{}", String::from_utf8_lossy(&compatible.stderr));
++}
+diff --git a/rustler_codegen/src/init.rs b/rustler_codegen/src/init.rs
+index 0585e2214249af890a55e1488c931b2acebdbf33..060d56d4134f2dc89f25b93acfaf349a8c11107c 100644
+--- a/rustler_codegen/src/init.rs
++++ b/rustler_codegen/src/init.rs
+@@ -56,7 +56,8 @@ impl From<InitMacroInput> for proc_macro2::TokenStream {
+         let inner = quote! {
+             static mut NIF_ENTRY: Option<rustler::codegen_runtime::ErlNifEntry> = None;
+             let nif_funcs: Box<[_]> =
+-                rustler::codegen_runtime::inventory::iter::<rustler::Nif>()
++                rustler::codegen_runtime::nifs_for_crate(
++                    concat!(env!("CARGO_CRATE_NAME"), "@", env!("CARGO_PKG_VERSION")))
+                 .map(rustler::Nif::get_def)
+                 .collect();
+ 
+@@ -70,7 +71,8 @@ impl From<InitMacroInput> for proc_macro2::TokenStream {
+                         let mut env = rustler::Env::new_init_env(&env, env);
+                         let load_info = rustler::Term::new(env, load_info);
+ 
+-                        if !rustler::codegen_runtime::ResourceRegistration::register_all_collected(env).is_ok() {
++                        if !rustler::codegen_runtime::ResourceRegistration::register_for_crate(env,
++                            concat!(env!("CARGO_CRATE_NAME"), "@", env!("CARGO_PKG_VERSION"))).is_ok() {
+                             return 1;
+                         }
+ 
+diff --git a/rustler_codegen/src/nif.rs b/rustler_codegen/src/nif.rs
+index 3f8f88dbc80076ad513430c2c5649920296bc84d..404a8caec082fd9a82f6e2ad3ebde218e2d2ad37 100644
+--- a/rustler_codegen/src/nif.rs
++++ b/rustler_codegen/src/nif.rs
+@@ -93,7 +93,7 @@ pub fn transcoder_decorator(nif_attributes: NifAttributes, fun: syn::ItemFn) ->
+                     }
+                     nif_func
+                 }
+-            }
++            }.with_crate(concat!(env!("CARGO_CRATE_NAME"), "@", env!("CARGO_PKG_VERSION")))
+         );
+     }
+ }
+diff --git a/rustler_codegen/src/resource_impl.rs b/rustler_codegen/src/resource_impl.rs
+index 1e8049af4e0ae2cafcbfe3a24657334a0754a1ee..7aa97fc79a8d5ef44a54efc12230cae335cd0a99 100644
+--- a/rustler_codegen/src/resource_impl.rs
++++ b/rustler_codegen/src/resource_impl.rs
+@@ -1,6 +1,6 @@
+ use proc_macro2::{Span, TokenStream};
+ use quote::quote;
+-use std::collections::HashSet;
++use std::collections::BTreeSet;
+ use syn::{meta::ParseNestedMeta, LitBool, LitStr};
+ 
+ pub struct Attributes {
+@@ -41,8 +41,8 @@ pub fn transcoder_decorator(attrs: Attributes, mut input: syn::ItemImpl) -> Toke
+         _ => panic!("Can only implement trait on concrete types"),
+     };
+ 
+-    let mut to_add: HashSet<String> = HashSet::new();
+-    let mut already_has: HashSet<String> = HashSet::new();
++    let mut to_add: BTreeSet<String> = BTreeSet::new();
++    let mut already_has: BTreeSet<String> = BTreeSet::new();
+ 
+     for item in input.items.iter() {
+         if let syn::ImplItem::Fn(f) = item {
+@@ -69,13 +69,13 @@ pub fn transcoder_decorator(attrs: Attributes, mut input: syn::ItemImpl) -> Toke
+         if let Some(name) = attrs.name {
+             res.extend(quote!(
+             rustler::codegen_runtime::inventory::submit!(
+-                rustler::codegen_runtime::ResourceRegistration::new::<#type_path>().with_name(#name)
++                rustler::codegen_runtime::ResourceRegistration::new::<#type_path>().with_crate(concat!(env!("CARGO_CRATE_NAME"), "@", env!("CARGO_PKG_VERSION"))).with_name(#name)
+             );
+                 ));
+         } else {
+             res.extend(quote!(
+             rustler::codegen_runtime::inventory::submit!(
+-                rustler::codegen_runtime::ResourceRegistration::new::<#type_path>()
++                rustler::codegen_runtime::ResourceRegistration::new::<#type_path>().with_crate(concat!(env!("CARGO_CRATE_NAME"), "@", env!("CARGO_PKG_VERSION")))
+             );
+             ));
+         }
+diff --git a/rustler_codegen/src/tagged_enum.rs b/rustler_codegen/src/tagged_enum.rs
+index 6fac60fe6701dde9239425a7f98266c852cdf409..4a099de813bd82b9648ec882008492bde693bade 100644
+--- a/rustler_codegen/src/tagged_enum.rs
++++ b/rustler_codegen/src/tagged_enum.rs
+@@ -2,7 +2,7 @@ use proc_macro2::{Span, TokenStream};
+ use quote::{quote, quote_spanned};
+ 
+ use heck::ToSnakeCase;
+-use std::collections::HashMap;
++use std::collections::BTreeMap;
+ use syn::{self, spanned::Spanned, Field, Fields, FieldsNamed, FieldsUnnamed, Ident, Variant};
+ 
+ use super::context::Context;
+@@ -41,7 +41,7 @@ pub fn transcoder_decorator(ast: &syn::DeriveInput) -> TokenStream {
+             let atom_fn = Context::ident_to_atom_fun(atom_ident);
+             (atom_str, atom_fn)
+         })
+-        .collect::<HashMap<_, _>>()
++        .collect::<BTreeMap<_, _>>()
+         .into_iter()
+         .map(|(atom_str, atom_fn)| {
+             quote! {

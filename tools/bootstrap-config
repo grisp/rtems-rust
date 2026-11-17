@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""Configure an offline source bootstrap against an existing RTEMS C SDK."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def source_identity():
+    pins = ROOT / "sources.json"
+    sources = json.loads(pins.read_text())
+    inputs = [pins]
+    for name, item in sources["components"].items():
+        patch = ROOT / "patches" / (name + ".patch")
+        if hashlib.sha256(patch.read_bytes()).hexdigest() != item["patch_sha256"]:
+            raise ValueError(f"source patch checksum changed: {patch}")
+        inputs.append(patch)
+        for backport in item.get("backports", []):
+            path = ROOT / "patches" / backport["patch"]
+            if hashlib.sha256(path.read_bytes()).hexdigest() != backport["patch_sha256"]:
+                raise ValueError(f"source patch checksum changed: {path}")
+            inputs.append(path)
+    return hashlib.sha256(pins.read_bytes()).hexdigest(), sources, inputs
+
+
+def bootstrap_identity(sources):
+    inputs = {name: sources["components"][name] for name in ("rust", "libc")}
+    inputs["stage0"] = sources["stage0"]
+    return hashlib.sha256(json.dumps(inputs, sort_keys=True).encode()).hexdigest()
+
+
+def c_sdk_identity(prefix, target):
+    # Include the installed compiler, headers and runtime metadata so rebuilding
+    # the C SDK invalidates cached Rust std even at the same installation path.
+    files = [prefix / "bin" / (target + "-gcc")]
+    files.extend(prefix.glob("GRISP_TOOLCHAIN_*"))
+    for directory in (prefix / target, prefix / "lib/gcc" / target):
+        files.extend(path for path in directory.rglob("*")
+                     if path.is_file() and (path.suffix in (".a", ".h") or path.name == "cc1"))
+    digest = hashlib.sha256(str(prefix.resolve()).encode())
+    for path in sorted(files):
+        info = path.stat()
+        digest.update(f"{path.relative_to(prefix)}:{info.st_size}:{info.st_mtime_ns}\n".encode())
+    return digest.hexdigest()
+
+
+def check_reuse(directory, expected, identity, sources, inputs):
+    config = directory / "bootstrap.toml"
+    if not config.is_file():
+        raise ValueError("no prepared Rust bootstrap.toml; run rust-toolchain first")
+    def normalize(text):
+        text = re.sub(r"^jobs = [0-9]+$", "jobs = 0", text, flags=re.MULTILINE)
+        # Distribution installation can move without changing compiled code.
+        return re.sub(r"^prefix = .*", 'prefix = ""', text, flags=re.MULTILINE)
+    if normalize(config.read_text()) != normalize(expected):
+        raise ValueError("retained bootstrap configuration differs; restore its SDK/host/target settings or run a fresh rust-toolchain build")
+    if (directory / "git-commit-hash").read_text().strip() != sources["components"]["rust"]["base"]:
+        raise ValueError("retained Rust source revision differs from the source pins")
+    stamp = directory / ".rtems-rust-inputs.json"
+    if stamp.exists():
+        saved = json.loads(stamp.read_text())
+        matches = (saved["bootstrap_sha256"] == bootstrap_identity(sources)
+                   if "bootstrap_sha256" in saved else saved["sources_sha256"] == identity)
+        if not matches:
+            raise ValueError("source pins changed; use a fresh rust-toolchain build")
+    elif any(path.stat().st_mtime_ns > config.stat().st_mtime_ns for path in inputs):
+        # Adopt an older prepared tree only when its configuration still matches
+        # and none of the pinned inputs has been refreshed since preparation.
+        raise ValueError("cannot adopt this older build after source inputs changed; use a fresh rust-toolchain build")
+
+
+def target_environment(target, flags):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", target):
+        raise ValueError("expected a built-in target triple")
+    key = target.replace("-", "_")
+    return (f"export CFLAGS_{key}={shlex.quote(flags)}\n"
+            f"export CXXFLAGS_{key}={shlex.quote(flags)}\n")
+
+
+def host_environment():
+    # RSB prepends its limited pkg-config wrapper to PATH. Cargo's native
+    # dependencies need the host implementation and its system search paths.
+    search = os.environ.get("SB_ORIG_PATH", os.environ.get("PATH", os.defpath))
+    program = shutil.which(os.environ.get("HOST_PKG_CONFIG", "pkg-config"), path=search)
+    if program is None:
+        raise ValueError("native pkg-config is required to build Cargo; install it on the host or set HOST_PKG_CONFIG to its executable")
+    return "export HOST_PKG_CONFIG=" + shlex.quote(program) + "\n"
+
+
+def write_changed(path, text):
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+
+
+def stage_dependency_notices(source_root, dependency, name, version):
+    # Rust's copyright generator looks up external path dependencies by package
+    # name/version in vendor/. A notice-only directory has no Cargo.toml, so
+    # Cargo ignores it as a source and still uses the explicit std path patch.
+    destination = source_root / "vendor" / (name + "-" + version)
+    if (destination / "Cargo.toml").exists() or (destination / ".cargo-checksum.json").exists():
+        raise ValueError(f"refusing to overwrite a vendored Cargo package: {destination}")
+    notices = [path for path in dependency.iterdir()
+               if any(word in path.name.lower() for word in
+                      ("copyright", "licence", "license", "author", "notice"))]
+    if not notices:
+        raise ValueError(f"no dependency notices found in {dependency}")
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in notices:
+        target = destination / path.name
+        if path.is_dir():
+            shutil.copytree(path, target, dirs_exist_ok=True)
+        elif path.is_file() and (not target.exists() or path.read_bytes() != target.read_bytes()):
+            shutil.copy2(path, target)
+
+
+def host_triple(system, machine):
+    machine = {"arm64": "aarch64", "amd64": "x86_64"}.get(machine, machine)
+    hosts = {("linux", "x86_64"): "x86_64-unknown-linux-gnu",
+             ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
+             ("darwin", "x86_64"): "x86_64-apple-darwin",
+             ("darwin", "aarch64"): "aarch64-apple-darwin"}
+    try:
+        return hosts[system.lower(), machine.lower()]
+    except KeyError:
+        raise ValueError(f"unsupported Rust SDK host: {system}/{machine}") from None
+
+
+def configuration(host, target, prefix, stage0, c_target, jobs, c_prefix=None):
+    c_prefix = c_prefix or prefix
+    q = lambda x: json.dumps(str(x))
+    native = "X86" if host.startswith("x86_64-") else "AArch64"
+    return f'''[build]
+build = {q(host)}
+host = [{q(host)}]
+target = [{q(host)}, {q(target)}]
+rustc = {q(stage0 / "bin/rustc")}
+cargo = {q(stage0 / "bin/cargo")}
+extended = true
+tools = ["cargo"]
+vendor = true
+locked-deps = true
+submodules = false
+docs = false
+jobs = {jobs}
+
+[install]
+prefix = {q(prefix)}
+sysconfdir = "etc"
+libdir = "lib"
+
+[llvm]
+download-ci-llvm = false
+targets = "ARM;{native}"
+assertions = false
+
+[rust]
+download-rustc = false
+channel = "stable"
+rpath = true
+
+[target.{target}]
+cc = {q(c_prefix / "bin" / (c_target + "-gcc"))}
+cxx = {q(c_prefix / "bin" / (c_target + "-g++"))}
+ar = {q(c_prefix / "bin" / (c_target + "-ar"))}
+linker = {q(c_prefix / "bin" / (c_target + "-gcc"))}
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--prefix", required=True, type=Path)
+    parser.add_argument("--stage0", required=True, type=Path)
+    parser.add_argument("--c-target", required=True)
+    parser.add_argument("--c-prefix", type=Path)
+    parser.add_argument("--errno", required=True, choices=["__errno", "_tls_errno"])
+    parser.add_argument("--libc", required=True, type=Path)
+    parser.add_argument("--jobs", type=int, default=2)
+    parser.add_argument("--target-cflags", default="")
+    parser.add_argument("--reuse", action="store_true")
+    parser.add_argument("--check-only", action="store_true")
+    args = parser.parse_args()
+    native = host_triple(platform.system(), platform.machine())
+    if native != args.host:
+        parser.error(f"native Rust bootstrap needs host {native}, selected {args.host}")
+    if args.jobs < 1:
+        parser.error("jobs must be positive")
+    c_prefix = (args.c_prefix or args.prefix).resolve()
+    expected = configuration(args.host, args.target, args.prefix.resolve(), args.stage0.resolve(),
+                             args.c_target, args.jobs, c_prefix)
+    identity, sources, inputs = source_identity()
+    c_identity = c_sdk_identity(c_prefix, args.c_target)
+    if args.reuse:
+        try:
+            check_reuse(Path.cwd(), expected, identity, sources, inputs)
+            saved = json.loads(Path(".rtems-rust-inputs.json").read_text())
+            if saved.get("c_sdk_identity", c_identity) != c_identity:
+                raise ValueError("C SDK changed; rebuild Rust std with RUST_REBUILD=1")
+        except (ValueError, OSError) as error:
+            parser.error(str(error))
+    elif args.check_only:
+        parser.error("--check-only requires --reuse")
+    gcc = c_prefix / "bin" / (args.c_target + "-gcc")
+    nm = c_prefix / "bin" / (args.c_target + "-nm")
+    archive = subprocess.check_output([gcc, *shlex.split(args.target_cflags),
+                                       "-print-file-name=libc.a"], text=True).strip()
+    symbols = subprocess.check_output([nm, "-g", "--defined-only", archive], text=True)
+    if not any(line.split() and line.split()[-1] == args.errno for line in symbols.splitlines()):
+        parser.error(f"C SDK does not define the selected Newlib errno symbol {args.errno}")
+    try:
+        environment = host_environment() + target_environment(args.target, args.target_cflags)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.check_only:
+        print("Retained Rust inputs, configuration and C runtime match; compiler work can be reused")
+        return
+    manifest = Path("library/Cargo.toml")
+    text = manifest.read_text()
+    entry = "libc = { path = " + json.dumps(str(args.libc.resolve())) + " }\n"
+    if entry not in text:
+        if "\nlibc = { path =" in text:
+            parser.error("standard library already has another libc override")
+        text = text.replace("[patch.crates-io]\n", "[patch.crates-io]\n" + entry, 1)
+        manifest.write_text(text)
+    stage_dependency_notices(Path.cwd(), args.libc, "libc", sources["components"]["libc"]["version"])
+    write_changed(Path("bootstrap.toml"), expected)
+    write_changed(Path("rtems-rust-env.sh"), environment)
+    write_changed(Path(".rtems-rust-inputs.json"), json.dumps({
+        "sources_sha256": identity, "bootstrap_sha256": bootstrap_identity(sources),
+        "c_sdk_identity": c_identity}, indent=2, sort_keys=True) + "\n")
+
+
+if __name__ == "__main__":
+    main()

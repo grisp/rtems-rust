@@ -1,0 +1,2 @@
+%include grisp2/grisp2-rust-defaults.bset
+%include rtems-rust-nif-support.bset

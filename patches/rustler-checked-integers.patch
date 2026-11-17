@@ -1,0 +1,38 @@
+From bd34ad27831482b0d0dec19a87cdddda91556f06 Mon Sep 17 00:00:00 2001
+From: Danila Poyarkov <dev@dannote.net>
+Date: Fri, 23 Oct 2026 04:24:52 +0400
+Subject: [PATCH] Reject out-of-range integer decoding
+
+Backport the checked integer conversion from upstream commit
+bd34ad27831482b0d0dec19a87cdddda91556f06 (#785) to Rustler 0.39.0.
+
+Read integer terms through their NIF API type, then use try_from and return
+BadArg when the destination cannot represent the value. In particular, a
+u64 term must not truncate when decoded as usize on a 32-bit target.
+
+This backport excludes the upstream char and NonZero codec additions.
+
+---
+
+diff --git a/rustler/src/types/primitive.rs b/rustler/src/types/primitive.rs
+index 0d334a1cdf588208ff0bb9b2d3b323f58307ff73..ca9c71a8c86aaed975480f22d57bf3587ff733e7 100644
+--- a/rustler/src/types/primitive.rs
++++ b/rustler/src/types/primitive.rs
+@@ -34,13 +34,16 @@ macro_rules! impl_number_decoder {
+     ($dec_type:ty, $nif_type:ty, $decode_fun:ident) => {
+         impl<'a> Decoder<'a> for $dec_type {
+             #[inline]
++            #[allow(clippy::useless_conversion, clippy::unnecessary_fallible_conversions)]
+             fn decode(term: Term) -> NifResult<$dec_type> {
+                 #![allow(unused_unsafe)]
+                 let mut res: $nif_type = Default::default();
+                 if erl_get!($decode_fun, term, res) == 0 {
+                     return Err(Error::BadArg);
+                 }
+-                Ok(res as $dec_type)
++                // An integer the term holds but the type cannot, such as 300 for a `u8`, is
++                // rejected rather than truncated.
++                <$dec_type>::try_from(res).map_err(|_| Error::BadArg)
+             }
+         }
+     };

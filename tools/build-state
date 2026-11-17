@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Track installed Rust package inputs and select compatible bootstrap work."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import platform
+import runpy
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+BOOTSTRAP = runpy.run_path(str(ROOT / "tools/bootstrap-config"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["context", "reuse-option"])
+    parser.add_argument("--build-root", required=True, type=Path)
+    parser.add_argument("--prefix", required=True, type=Path)
+    parser.add_argument("--c-prefix", required=True, type=Path)
+    parser.add_argument("--c-target", required=True)
+    parser.add_argument("--fresh", action="store_true")
+    args = parser.parse_args()
+    host = BOOTSTRAP["host_triple"](platform.system(), platform.machine())
+    c_prefix = args.c_prefix.resolve()
+    c_identity = BOOTSTRAP["c_sdk_identity"](c_prefix, args.c_target)
+    identity, sources, _ = BOOTSTRAP["source_identity"]()
+    context = {"host": host, "prefix": os.path.relpath(args.prefix.resolve(), args.build_root.resolve()),
+               "sources_sha256": identity, "c_sdk_identity": c_identity}
+    if args.action == "context":
+        args.build_root.mkdir(parents=True, exist_ok=True)
+        BOOTSTRAP["write_changed"](args.build_root / "inputs.json",
+                                   json.dumps(context, indent=2, sort_keys=True) + "\n")
+        return
+    if args.fresh:
+        return
+    version = sources["components"]["rust"]["version"]
+    directory = args.build_root / "build" / ("rtems-rust-" + host + "-" + version)
+    directory = directory / ("rustc-" + version + "-src")
+    try:
+        saved = json.loads((directory / ".rtems-rust-inputs.json").read_text())
+        config = (directory / "bootstrap.toml").read_text()
+    except FileNotFoundError:
+        return
+    compiler = json.dumps(str(c_prefix / "bin" / (args.c_target + "-gcc")))
+    matches = (saved["bootstrap_sha256"] == BOOTSTRAP["bootstrap_identity"](sources)
+               if "bootstrap_sha256" in saved else saved.get("sources_sha256") == identity)
+    if (matches
+            and saved.get("c_sdk_identity", c_identity) == c_identity
+            and "cc = " + compiler + "\n" in config):
+        print("--with-rust-reuse")
+    else:
+        print("Rust source pins or C SDK changed; starting a fresh core build", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

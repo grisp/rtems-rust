@@ -1,0 +1,181 @@
+From 3c114f99e458a3118c3af3805ef20b65c1101b2b Mon Sep 17 00:00:00 2001
+From: Sebastien Merle <s.merle@gmail.com>
+Date: Sat, 14 Nov 2026 00:32:43 +0100
+Subject: [PATCH] Fix RTEMS ARM ABI and standard library support
+
+Match the RTEMS ARM GCC enum layout and use libc's UID/GID types.
+Update the standard library's libc dependency to 0.2.191 and adapt
+file metadata access to its timespec fields, retaining nanoseconds.
+
+Add an explicit build-time selector for Newlib configurations using
+__errno(), preserving the default TLS errno path.
+
+---
+
+diff --git a/compiler/rustc_target/src/spec/targets/armv7_rtems_eabihf.rs b/compiler/rustc_target/src/spec/targets/armv7_rtems_eabihf.rs
+index 90daac16bcc78625664c17fcb8ef8772c7773c3e..6e284e839595a3f5b2554ab48a29d20176920189 100644
+--- a/compiler/rustc_target/src/spec/targets/armv7_rtems_eabihf.rs
++++ b/compiler/rustc_target/src/spec/targets/armv7_rtems_eabihf.rs
+@@ -28,8 +28,8 @@ pub(crate) fn target() -> Target {
+             features: "+thumb2,+neon,+vfp3".into(),
+             max_atomic_width: Some(64),
+             emit_debug_gdb_scripts: false,
+-            // GCC defaults to 8 for arm-none here.
+-            c_enum_min_bits: Some(8),
++            // Match the int-sized C enums used by the RTEMS ARM GCC toolchain.
++            c_enum_min_bits: Some(32),
+             eh_frame_header: false,
+             no_default_libraries: false,
+             env: Env::Newlib,
+diff --git a/library/Cargo.lock b/library/Cargo.lock
+index 98fa2c5117411666b278b540af973eac24748429..bd63144008d6cc93567f6b9ef4ff5d9194d77978 100644
+--- a/library/Cargo.lock
++++ b/library/Cargo.lock
+@@ -153,9 +153,9 @@ dependencies = [
+ 
+ [[package]]
+ name = "libc"
+-version = "0.2.189"
++version = "0.2.191"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
++checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+ dependencies = [
+  "rustc-std-workspace-core",
+ ]
+diff --git a/library/std/build.rs b/library/std/build.rs
+index 98856b58d890fb3d7a2cd64faebd5ac1dae27bcd..6006c3e9264c559826f05241480447d6c8d7d90e 100644
+--- a/library/std/build.rs
++++ b/library/std/build.rs
+@@ -8,6 +8,12 @@ fn main() {
+         env::var("CARGO_CFG_TARGET_VENDOR").expect("CARGO_CFG_TARGET_VENDOR was not set");
+     let target_env = env::var("CARGO_CFG_TARGET_ENV").expect("CARGO_CFG_TARGET_ENV was not set");
+ 
++    println!("cargo:rustc-check-cfg=cfg(rtems_newlib_no_tls_errno)");
++    println!("cargo:rerun-if-env-changed=RUSTC_STD_RTEMS_NEWLIB_NO_TLS_ERRNO");
++    if target_os == "rtems" && env::var_os("RUSTC_STD_RTEMS_NEWLIB_NO_TLS_ERRNO").is_some() {
++        println!("cargo:rustc-cfg=rtems_newlib_no_tls_errno");
++    }
++
+     println!("cargo:rustc-check-cfg=cfg(netbsd10)");
+     if target_os == "netbsd" && env::var("RUSTC_STD_NETBSD10").is_ok() {
+         println!("cargo:rustc-cfg=netbsd10");
+diff --git a/library/std/src/os/rtems/fs.rs b/library/std/src/os/rtems/fs.rs
+index ab662e565407170bf6f7bf841ac4a8cfaf1df761..92ea362f055281a3cb82333928a99f248ce1b3cf 100644
+--- a/library/std/src/os/rtems/fs.rs
++++ b/library/std/src/os/rtems/fs.rs
+@@ -357,27 +357,27 @@ fn st_size(&self) -> u64 {
+     }
+ 
+     fn st_atime(&self) -> i64 {
+-        self.as_inner().as_inner().st_atime as i64
++        self.as_inner().as_inner().st_atim.tv_sec as i64
+     }
+ 
+     fn st_atime_nsec(&self) -> i64 {
+-        0
++        self.as_inner().as_inner().st_atim.tv_nsec as i64
+     }
+ 
+     fn st_mtime(&self) -> i64 {
+-        self.as_inner().as_inner().st_mtime as i64
++        self.as_inner().as_inner().st_mtim.tv_sec as i64
+     }
+ 
+     fn st_mtime_nsec(&self) -> i64 {
+-        0
++        self.as_inner().as_inner().st_mtim.tv_nsec as i64
+     }
+ 
+     fn st_ctime(&self) -> i64 {
+-        self.as_inner().as_inner().st_ctime as i64
++        self.as_inner().as_inner().st_ctim.tv_sec as i64
+     }
+ 
+     fn st_ctime_nsec(&self) -> i64 {
+-        0
++        self.as_inner().as_inner().st_ctim.tv_nsec as i64
+     }
+ 
+     fn st_blksize(&self) -> u64 {
+diff --git a/library/std/src/os/unix/process.rs b/library/std/src/os/unix/process.rs
+index 9fa731de826913ab0114911d3f6108526d4af62c..6ba9093d043f97cffead393c7ffe6b7175741e1c 100644
+--- a/library/std/src/os/unix/process.rs
++++ b/library/std/src/os/unix/process.rs
+@@ -25,6 +25,10 @@
+         type UserId = i32;
+         type GroupId = i32;
+     }
++    target_os = "rtems" => {
++        type UserId = libc::uid_t;
++        type GroupId = libc::gid_t;
++    }
+     _ => {
+         type UserId = u32;
+         type GroupId = u32;
+diff --git a/library/std/src/sys/fs/unix.rs b/library/std/src/sys/fs/unix.rs
+index 46d5d33d23ac23d74e44d147b58925c2edbb6bda..3e0224086f6256f7da739e7892d62298fb8d9e47 100644
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -590,7 +590,6 @@ pub fn modified(&self) -> io::Result<SystemTime> {
+         all(target_os = "vxworks", vxworks_lt_25_09),
+         target_os = "espidf",
+         target_os = "vita",
+-        target_os = "rtems",
+     ))]
+     pub fn modified(&self) -> io::Result<SystemTime> {
+         SystemTime::new(self.stat.st_mtime as i64, 0)
+@@ -600,6 +599,7 @@ pub fn modified(&self) -> io::Result<SystemTime> {
+         target_os = "horizon",
+         target_os = "hurd",
+         target_os = "nuttx",
++        target_os = "rtems",
+         all(target_os = "vxworks", not(vxworks_lt_25_09))
+     ))]
+     pub fn modified(&self) -> io::Result<SystemTime> {
+@@ -630,7 +630,6 @@ pub fn accessed(&self) -> io::Result<SystemTime> {
+         all(target_os = "vxworks", vxworks_lt_25_09),
+         target_os = "espidf",
+         target_os = "vita",
+-        target_os = "rtems"
+     ))]
+     pub fn accessed(&self) -> io::Result<SystemTime> {
+         SystemTime::new(self.stat.st_atime as i64, 0)
+@@ -640,6 +639,7 @@ pub fn accessed(&self) -> io::Result<SystemTime> {
+         target_os = "horizon",
+         target_os = "hurd",
+         target_os = "nuttx",
++        target_os = "rtems",
+         all(target_os = "vxworks", not(vxworks_lt_25_09))
+     ))]
+     pub fn accessed(&self) -> io::Result<SystemTime> {
+diff --git a/library/std/src/sys/io/error/unix.rs b/library/std/src/sys/io/error/unix.rs
+index 5f60abf9d9528eb7c595387c6efaf81ab692d97c..d1cd49da5aa08fbdbe3d251c2c6750375f7bbcc6 100644
+--- a/library/std/src/sys/io/error/unix.rs
++++ b/library/std/src/sys/io/error/unix.rs
+@@ -78,7 +78,7 @@ pub fn errno() -> i32 {
+     unsafe { libc::errnoGet() }
+ }
+ 
+-#[cfg(target_os = "rtems")]
++#[cfg(all(target_os = "rtems", not(rtems_newlib_no_tls_errno)))]
+ #[inline]
+ pub fn errno() -> i32 {
+     unsafe extern "C" {
+@@ -89,6 +89,16 @@ pub fn errno() -> i32 {
+     unsafe { _tls_errno as i32 }
+ }
+ 
++#[cfg(all(target_os = "rtems", rtems_newlib_no_tls_errno))]
++#[inline]
++pub fn errno() -> i32 {
++    unsafe extern "C" {
++        fn __errno() -> *mut c_int;
++    }
++
++    unsafe { *__errno() as i32 }
++}
++
+ #[cfg(target_os = "dragonfly")]
+ #[inline]
+ pub fn errno() -> i32 {

@@ -1,0 +1,5 @@
+%define rust_project %{with_rust_project}
+%define rust_rtems_major 5
+%define rust_c_target arm-rtems5
+%define rust_target armv7-rtems-eabihf
+%define rust_errno __errno

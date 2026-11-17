@@ -1,0 +1,5 @@
+%define release 1
+%include rust/versions.cfg
+%define _target %{rust_target}
+package: rtems-rust-nif-support-%{rust_rtems_major}
+rust/rust-nif-support.cfg
